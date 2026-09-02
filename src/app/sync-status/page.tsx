@@ -1,846 +1,621 @@
 "use client";
-import { useState, useEffect, useCallback, useRef } from "react";
-import CryptoJS from "crypto-js";
-import { components } from "../../types/adguard";
-import { SyncLogEntry, AutoSyncConfig } from "@/types/auto-sync";
-import { getConnectionId, type Connection } from "@/lib/connectionUtils";
-import { RefreshCw, GitCompare, History, ChevronDown, ChevronRight, Check, AlertCircle, Clock, Filter, Play, X, Pause } from "lucide-react";
 
-type FilterListItem = components['schemas']['Filter'];
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  RefreshCw, GitCompare, History, ChevronDown, ChevronRight, Check,
+  AlertCircle, Play, Server, ShieldCheck,
+} from "lucide-react";
+import type { SyncLogEntry, AutoSyncConfig } from "@/types/auto-sync";
+import {
+  diffCategory, driftedCategories, type DiffItem, type Settings,
+} from "@/lib/settingsDiff";
+import { useConnections } from "../contexts/ConnectionsContext";
+import {
+  Alert, Badge, Button, Card, CardHeader, EmptyState, Field, LogConsole,
+  Modal, PageHeader, Panel, Segmented, StatTile, CardSkeleton, useToast,
+} from "../components/ui";
 
-type SettingsValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: SettingsValue }
-  | SettingsValue[]
-  | FilterListItem;
+type ReplicaState = { settings?: Settings; errors?: Record<string, string> };
 
-type Settings = Record<string, SettingsValue>;
-
-const areSettingsEqual = (a: SettingsValue, b: SettingsValue): boolean => {
-  if (a === b) return true;
-  if ((a === null && Array.isArray(b) && b.length === 0) || (b === null && Array.isArray(a) && a.length === 0)) return true;
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return a === b;
-
-  if (Array.isArray(a) && Array.isArray(b)) {
-    const isFilterList = (arr: SettingsValue[]): arr is FilterListItem[] => {
-      if (arr.length === 0) return false;
-      const item = arr[0];
-      return typeof item === 'object' && item !== null && 'url' in item && 'name' in item;
-    };
-
-    if (isFilterList(a) && isFilterList(b)) {
-      const toComparableString = (item: FilterListItem) => JSON.stringify({ name: item.name, url: item.url, rules_count: item.rules_count });
-      const setA = new Set(a.map(toComparableString));
-      const setB = new Set(b.map(toComparableString));
-      if (setA.size !== setB.size) return false;
-      for (const item of setA) {
-        if (!setB.has(item)) return false;
-      }
-      return true;
-    }
-
-    if (a.length !== b.length) return false;
-    const sortKey = (arr: SettingsValue[]) => {
-      if (arr.length === 0) return arr;
-      const item = arr[0];
-      if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
-        if ('id' in item) return [...arr].sort((x, y) => ((x as { id: number }).id - (y as { id: number }).id));
-        if ('url' in item) return [...arr].sort((x, y) => String((x as { url: string }).url).localeCompare(String((y as { url: string }).url)));
-        if ('domain' in item) return [...arr].sort((x, y) => String((x as { domain: string }).domain).localeCompare(String((y as { domain: string }).domain)));
-      }
-      return [...arr].sort();
-    };
-    const sortedA = sortKey(a);
-    const sortedB = sortKey(b);
-    for (let i = 0; i < sortedA.length; i++) {
-      if (!areSettingsEqual(sortedA[i], sortedB[i])) return false;
-    }
-    return true;
-  }
-
-  const keysA = Object.keys(a);
-  const keysB = Object.keys(b);
-  const IGNORED_COMPARISON_KEYS = ['id', 'last_updated', 'default_local_ptr_upstreams'];
-  for (const key of keysA) {
-    if (IGNORED_COMPARISON_KEYS.includes(key)) continue;
-    if (!keysB.includes(key) || !areSettingsEqual((a as Record<string, SettingsValue>)[key], (b as Record<string, SettingsValue>)[key])) return false;
-  }
-  for (const key of keysB) {
-    if (IGNORED_COMPARISON_KEYS.includes(key)) continue;
-    if (!keysA.includes(key)) return false;
-  }
-  return true;
+const DIFF_TONE: Record<DiffItem['type'], 'info' | 'warning' | 'danger' | 'accent'> = {
+  setting: 'info',
+  missing: 'warning',
+  extra: 'danger',
+  changed: 'accent',
 };
 
+const CATEGORY_LABELS: Record<string, string> = {
+  filtering: 'Filtering',
+  querylogConfig: 'Query log config',
+  statsConfig: 'Statistics config',
+  dnsSettings: 'DNS settings',
+  rewrites: 'DNS rewrites',
+  blockedServices: 'Blocked services',
+  accessList: 'Access lists',
+};
+
+function relativeTime(timestamp: number | null): string {
+  if (!timestamp) return 'Never';
+  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function untilTime(timestamp: number | null): string {
+  if (!timestamp) return 'Not scheduled';
+  const seconds = Math.floor((timestamp - Date.now()) / 1000);
+  if (seconds < 0) return 'Any moment';
+  if (seconds < 60) return `in ${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  return `in ${Math.floor(minutes / 60)}h`;
+}
+
 export default function SyncStatusPage() {
-  const [connections, setConnections] = useState<Connection[]>([]);
-  const [masterServerIp, setMasterServerIp] = useState<string | null>(null);
+  const { connections, masterServerId, isLoading: connectionsLoading } = useConnections();
+  const { notify } = useToast();
+
+  const [tab, setTab] = useState<'status' | 'history'>('status');
   const [masterSettings, setMasterSettings] = useState<Settings | null>(null);
-  const [replicaSettings, setReplicaSettings] = useState<Record<string, { settings?: Settings; errors?: Record<string, string> }>>({});
+  const [replicas, setReplicas] = useState<Record<string, ReplicaState>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [syncing, setSyncing] = useState<string | null>(null);
-  const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null);
-  const [syncLogs, setSyncLogs] = useState<string[]>([]);
-  const [showLogModal, setShowLogModal] = useState<boolean>(false);
-  const [logModalTitle, setLogModalTitle] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'status' | 'auto-sync'>('status');
+  const [expanded, setExpanded] = useState<Record<string, string | null>>({});
+  const [syncingKey, setSyncingKey] = useState<string | null>(null);
+
+  const [syncLog, setSyncLog] = useState<string[]>([]);
+  const [syncModal, setSyncModal] = useState<{ title: string; running: boolean } | null>(null);
+
   const [autoSyncConfig, setAutoSyncConfig] = useState<AutoSyncConfig | null>(null);
   const [autoSyncLogs, setAutoSyncLogs] = useState<SyncLogEntry[]>([]);
   const [autoSyncRunning, setAutoSyncRunning] = useState(false);
   const [autoSyncPaused, setAutoSyncPaused] = useState(false);
-  const [nextSyncTime, setNextSyncTime] = useState<number | null>(null);
-  const [filterReplica, setFilterReplica] = useState<string>('all');
-  const [filterCategory, setFilterCategory] = useState<string>('all');
-  const [filterStatus, setFilterStatus] = useState<'all' | 'success' | 'error'>('all');
+  const [nextSync, setNextSync] = useState<number | null>(null);
   const [isTriggering, setIsTriggering] = useState(false);
-  const [expandedCategories, setExpandedCategories] = useState<Record<string, string | null>>({});
-  const encryptionKey = process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY || "adguard-buddy-key";
 
-  const showNotification = (message: string, type: 'success' | 'error') => {
-    setNotification({ message, type });
-    setTimeout(() => setNotification(null), 5000);
-  };
+  const [filterReplica, setFilterReplica] = useState('all');
+  const [filterCategory, setFilterCategory] = useState('all');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'success' | 'error'>('all');
 
   const fetchAutoSyncStatus = useCallback(async () => {
     try {
       const response = await fetch('/api/auto-sync-config');
-      if (!response || !response.ok) return;
+      if (!response?.ok) return;
       const data = await response.json();
       if (!data) return;
-      setAutoSyncConfig(data.config);
+      setAutoSyncConfig(data.config ?? null);
       setAutoSyncLogs(data.recentLogs || []);
-      setAutoSyncRunning(data.isRunning);
-      setAutoSyncPaused(data.isPaused || false);
-      setNextSyncTime(data.nextSync);
-    } catch (error) {
-      console.error('Failed to fetch auto-sync status:', error);
+      setAutoSyncRunning(Boolean(data.isRunning));
+      setAutoSyncPaused(Boolean(data.isPaused));
+      setNextSync(data.nextSync ?? null);
+    } catch {
+      /* status polling failures are not worth surfacing */
     }
   }, []);
 
-  const triggerAutoSync = async () => {
-    if (!autoSyncConfig?.enabled) {
-      showNotification('Auto-sync is not enabled. Enable it in Settings first.', 'error');
-      return;
-    }
-    if (autoSyncPaused) {
-      showNotification('Auto-sync is currently paused.', 'error');
+  const fetchAllSettings = useCallback(async () => {
+    if (connections.length === 0 || !masterServerId) {
+      setIsLoading(false);
       return;
     }
 
-    setIsTriggering(true);
+    setIsLoading(true);
+    setError(null);
     try {
-      const response = await fetch('/api/auto-sync-trigger', { method: 'POST' });
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Failed to trigger auto-sync');
+      const master = connections.find(c => c.id === masterServerId);
+      if (!master) {
+        setError('The configured master server no longer exists. Pick a new one in Settings.');
+        return;
       }
-      showNotification('Auto-sync triggered successfully!', 'success');
-      setTimeout(() => fetchAutoSyncStatus(), 2000);
-    } catch (error) {
-      const err = error as Error;
-      showNotification(`Failed to trigger auto-sync: ${err.message}`, 'error');
+
+      const fetchSettings = async (connectionId: string) => {
+        const response = await fetch('/api/get-all-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ connectionId }),
+        });
+        if (!response.ok) throw new Error(`Failed to fetch settings for ${connectionId}`);
+        return response.json();
+      };
+
+      const masterResult = await fetchSettings(master.id);
+      setMasterSettings(masterResult.settings);
+
+      const replicaConnections = connections.filter(c => c.id !== masterServerId);
+      const results = await Promise.all(replicaConnections.map(async connection => {
+        try {
+          const data = await fetchSettings(connection.id);
+          return { id: connection.id, state: { settings: data.settings, errors: data.errors } as ReplicaState };
+        } catch (err) {
+          return {
+            id: connection.id,
+            state: { errors: { request: err instanceof Error ? err.message : String(err) } } as ReplicaState,
+          };
+        }
+      }));
+
+      setReplicas(Object.fromEntries(results.map(r => [r.id, r.state])));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setIsTriggering(false);
+      setIsLoading(false);
     }
-  };
+  }, [connections, masterServerId]);
 
-  const handleSync = async (replicaIp: string, category: string) => {
+  useEffect(() => {
+    if (!connectionsLoading) fetchAllSettings();
+  }, [connectionsLoading, fetchAllSettings]);
+
+  useEffect(() => {
+    fetchAutoSyncStatus();
+    const interval = setInterval(fetchAutoSyncStatus, 10000);
+    return () => clearInterval(interval);
+  }, [fetchAutoSyncStatus]);
+
+  const runSync = async (replicaId: string, category: string) => {
     if (autoSyncRunning && !autoSyncPaused) {
-      showNotification('Manual sync is disabled while auto-sync is active.', 'error');
+      notify('Manual sync is disabled while auto-sync is active.', 'error');
       return;
     }
+    if (!masterServerId) return;
 
-    const syncKey = `${replicaIp}:${category}`;
-    setSyncing(syncKey);
-    setSyncLogs([]);
-    setLogModalTitle(`Syncing '${category}' to ${replicaIp}...`);
-    setShowLogModal(true);
-
-    const masterConn = connections.find(c => getConnectionId(c) === masterServerIp);
-    const replicaConn = connections.find(c => getConnectionId(c) === replicaIp);
-
-    if (!masterConn || !replicaConn) {
-      setSyncLogs(prev => [...prev, "Error: Master or replica connection not found."]);
-      setSyncing(null);
-      return;
-    }
+    const key = `${replicaId}:${category}`;
+    setSyncingKey(key);
+    setSyncLog([]);
+    setSyncModal({ title: `Syncing ${CATEGORY_LABELS[category] ?? category} to ${replicaId}`, running: true });
 
     try {
-      const sourceDecrypted = CryptoJS.AES.decrypt(masterConn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-      const destDecrypted = CryptoJS.AES.decrypt(replicaConn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-
       const response = await fetch('/api/sync-category', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sourceConnection: { ...masterConn, password: sourceDecrypted },
-          destinationConnection: { ...replicaConn, password: destDecrypted },
-          category,
-        }),
+        body: JSON.stringify({ sourceId: masterServerId, destinationId: replicaId, category }),
       });
 
       if (!response.ok || !response.body) {
-        const errorData = await response.json().catch(() => ({ message: 'Sync failed.' }));
-        throw new Error(errorData.message);
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `Sync failed (${response.status})`);
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
 
-      while (true) {
+      for (;;) {
         const { value, done } = await reader.read();
-        if (done) {
-          setLogModalTitle(prev => prev.replace('Syncing', 'Synced'));
-          break;
-        }
-
+        if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.substring(6));
-              setSyncLogs(prev => [...prev, data.message]);
-            } catch { }
+          if (!line.startsWith('data: ')) continue;
+          try {
+            setSyncLog(current => [...current, JSON.parse(line.slice(6)).message]);
+          } catch {
+            /* ignore malformed frames */
           }
         }
       }
-      setTimeout(() => fetchAllSettings(), 1000);
-    } catch (e: unknown) {
-      const errorMessage = `FATAL: ${e instanceof Error ? e.message : String(e)}`;
-      setSyncLogs(prev => [...prev, errorMessage]);
-      setLogModalTitle(prev => prev.replace('Syncing', 'Failed'));
-      showNotification(errorMessage, 'error');
+
+      setSyncModal({ title: `Synced ${CATEGORY_LABELS[category] ?? category} to ${replicaId}`, running: false });
+      setTimeout(fetchAllSettings, 1000);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setSyncLog(current => [...current, `FATAL: ${message}`]);
+      setSyncModal({ title: `Failed to sync to ${replicaId}`, running: false });
+      notify(message, 'error');
     } finally {
-      setSyncing(null);
+      setSyncingKey(null);
     }
   };
 
-  const fetchAllSettings = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-
+  const triggerAutoSync = async () => {
+    setIsTriggering(true);
     try {
-      const response = await fetch('/api/get-connections');
-      if (!response.ok) throw new Error('Failed to fetch connection settings.');
-      const config = await response.json();
-
-      if (!config.connections || !config.masterServerIp) {
-        setError("Master server or connections not configured.");
-        setIsLoading(false);
-        return;
+      const response = await fetch('/api/auto-sync-trigger', { method: 'POST' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || 'Failed to trigger auto-sync');
       }
-
-      const allConnections: Connection[] = config.connections;
-      const masterConn = allConnections.find(c => getConnectionId(c) === config.masterServerIp);
-      const replicaConns = allConnections.filter(c => getConnectionId(c) !== (config.masterServerIp || ''));
-
-      setConnections(allConnections);
-      setMasterServerIp(config.masterServerIp);
-
-      if (!masterConn) {
-        setError("Configured master server not found.");
-        setIsLoading(false);
-        return;
-      }
-
-      const fetchSettingsFor = async (conn: Connection) => {
-        let decrypted = "";
-        try {
-          decrypted = CryptoJS.AES.decrypt(conn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-        } catch { }
-        const response = await fetch('/api/get-all-settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...conn, password: decrypted }),
-        });
-        if (!response.ok) throw new Error(`Failed to fetch settings for ${conn.ip}`);
-        return response.json();
-      };
-
-      const masterResult = await fetchSettingsFor(masterConn);
-      setMasterSettings(masterResult.settings);
-
-      const replicaPromises = replicaConns.map(conn =>
-        fetchSettingsFor(conn).then(data => ({
-          id: getConnectionId(conn),
-          settings: data.settings,
-          errors: data.errors
-        }))
-      );
-
-      const allReplicas = await Promise.all(replicaPromises);
-      const replicaData = allReplicas.reduce((acc, current) => {
-        acc[current.id] = { settings: current.settings, errors: current.errors };
-        return acc;
-      }, {} as Record<string, { settings?: Settings; errors?: Record<string, string> }>);
-      setReplicaSettings(replicaData);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      notify('Auto-sync triggered.', 'success');
+      setTimeout(fetchAutoSyncStatus, 2000);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
-      setIsLoading(false);
+      setIsTriggering(false);
     }
-  }, [encryptionKey]);
-
-  useEffect(() => {
-    fetchAllSettings();
-    fetchAutoSyncStatus();
-    const interval = setInterval(fetchAutoSyncStatus, 10000);
-    return () => clearInterval(interval);
-  }, [fetchAllSettings, fetchAutoSyncStatus]);
-
-  const LogViewerModal = ({ title, logs, show, onClose }: { title: string, logs: string[], show: boolean, onClose: () => void }) => {
-    const logsEndRef = useRef<HTMLDivElement>(null);
-    useEffect(() => {
-      logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [logs]);
-    if (!show) return null;
-
-    // Check if sync is still running (no "Done." or error message at the end)
-    const isRunning = logs.length === 0 || (!logs[logs.length - 1]?.includes('Done.') && !logs[logs.length - 1]?.includes('ERROR') && !logs[logs.length - 1]?.includes('FATAL'));
-
-    return (
-      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
-        <div className="bg-[#181A20] border border-[#2A2D35] rounded-xl shadow-2xl w-full max-w-4xl h-[70vh] flex flex-col">
-          <div className="flex justify-between items-center p-4 border-b border-[#2A2D35]">
-            <div className="flex items-center gap-3">
-              <h2 className="text-lg font-bold text-white">{title}</h2>
-              {isRunning && (
-                <div className="flex items-center gap-2">
-                  <RefreshCw className="w-4 h-4 text-[var(--primary)] animate-spin" />
-                  <span className="text-xs text-gray-400">Processing...</span>
-                </div>
-              )}
-            </div>
-            <button onClick={onClose} className="text-gray-400 hover:text-white p-1 rounded-lg hover:bg-white/10 transition-colors">
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-
-          {/* Info message */}
-          {isRunning && (
-            <div className="px-4 py-2 bg-blue-500/10 border-b border-blue-500/20 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-blue-400" />
-              <span className="text-xs text-blue-400">Filter sync may take a few minutes while servers download the latest rules...</span>
-            </div>
-          )}
-
-          <div className="flex-grow p-4 overflow-y-auto font-mono text-sm text-gray-300 bg-[#0F1115]">
-            {logs.map((log, index) => (
-              <div key={index} className={`${log.startsWith('ERROR') || log.startsWith('FATAL') ? 'text-red-400' : ''} ${log.includes('Done.') ? 'text-[var(--primary)] font-bold' : ''}`}>{`> ${log}`}</div>
-            ))}
-            {isRunning && logs.length > 0 && (
-              <div className="flex items-center gap-2 mt-2 text-gray-500">
-                <div className="w-2 h-2 bg-[var(--primary)] rounded-full animate-pulse"></div>
-                <span className="text-xs">Waiting for response...</span>
-              </div>
-            )}
-            <div ref={logsEndRef} />
-          </div>
-        </div>
-      </div>
-    );
   };
 
-  const formatTimeAgo = (timestamp: number | null): string => {
-    if (!timestamp) return 'Never';
-    const seconds = Math.floor((Date.now() - timestamp) / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    return `${Math.floor(hours / 24)}d ago`;
-  };
+  const replicaEntries = useMemo(() => Object.entries(replicas), [replicas]);
+  const inSyncCount = useMemo(() => replicaEntries.filter(([, state]) =>
+    state.settings && masterSettings && driftedCategories(masterSettings, state.settings).length === 0
+  ).length, [replicaEntries, masterSettings]);
 
-  const formatNextSync = (timestamp: number | null): string => {
-    if (!timestamp) return 'N/A';
-    const seconds = Math.floor((timestamp - Date.now()) / 1000);
-    if (seconds < 0) return 'Any moment';
-    if (seconds < 60) return `in ${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `in ${minutes}m`;
-    return `in ${Math.floor(minutes / 60)}h`;
-  };
+  const filteredLogs = autoSyncLogs.filter(log =>
+    (filterReplica === 'all' || log.replicaId === filterReplica) &&
+    (filterCategory === 'all' || log.category === filterCategory) &&
+    (filterStatus === 'all' || log.status === filterStatus)
+  );
 
-  const filteredAutoSyncLogs = autoSyncLogs.filter(log => {
-    if (filterReplica !== 'all' && log.replicaId !== filterReplica) return false;
-    if (filterCategory !== 'all' && log.category !== filterCategory) return false;
-    if (filterStatus !== 'all' && log.status !== filterStatus) return false;
-    return true;
-  });
-
-  // Component to display differences between master and target for a category
-  const DiffDisplay = ({ category, masterData, targetData }: { category: string, masterData: SettingsValue, targetData: SettingsValue }) => {
-    if (!masterData && !targetData) return null;
-
-    // Helper to identify differences
-    type DiffItem = { name: string, masterVal: string, targetVal: string, type: 'missing' | 'extra' | 'changed' | 'setting' };
-    const diffs: DiffItem[] = [];
-
-    // For filtering category - show ALL differences
-    if (category === 'filtering') {
-      const masterSettings = masterData as Record<string, SettingsValue>;
-      const targetSettings = targetData as Record<string, SettingsValue>;
-
-      // Comparators for settings
-      if (masterSettings.enabled !== targetSettings.enabled) {
-        diffs.push({
-          name: 'Filtering Enabled',
-          masterVal: masterSettings.enabled ? '✓ Enabled' : '○ Disabled',
-          targetVal: targetSettings.enabled ? '✓ Enabled' : '○ Disabled',
-          type: 'setting'
-        });
-      }
-
-      if (masterSettings.interval !== targetSettings.interval) {
-        diffs.push({
-          name: 'Update Interval',
-          masterVal: `${masterSettings.interval}h`,
-          targetVal: `${targetSettings.interval}h`,
-          type: 'setting'
-        });
-      }
-
-      const masterRules = Array.isArray(masterSettings.user_rules) ? masterSettings.user_rules : [];
-      const targetRules = Array.isArray(targetSettings.user_rules) ? targetSettings.user_rules : [];
-      if (JSON.stringify(masterRules) !== JSON.stringify(targetRules)) {
-        diffs.push({
-          name: 'User Rules',
-          masterVal: `${masterRules.length} rules`,
-          targetVal: `${targetRules.length} rules`,
-          type: 'setting'
-        });
-      }
-
-      // Filter Lists Comparison
-      const getFilters = (data: Record<string, SettingsValue>, key: string) => {
-        return (Array.isArray(data[key]) ? data[key] as FilterListItem[] : []);
-      };
-
-      const compareLists = (listName: string, mList: FilterListItem[], tList: FilterListItem[]) => {
-        const tMap = new Map(tList.map(f => [f.url, f]));
-        const mMap = new Map(mList.map(f => [f.url, f]));
-
-        mList.forEach(m => {
-          const t = tMap.get(m.url);
-          if (!t) {
-            diffs.push({
-              name: m.name,
-              masterVal: 'Present',
-              targetVal: 'Missing',
-              type: 'missing'
-            });
-          } else {
-            if (m.enabled !== t.enabled) {
-              diffs.push({
-                name: m.name,
-                masterVal: m.enabled ? '✓ Enabled' : '○ Disabled',
-                targetVal: t.enabled ? '✓ Enabled' : '○ Disabled',
-                type: 'changed'
-              });
-            }
-            if (m.rules_count !== t.rules_count) {
-              diffs.push({
-                name: m.name,
-                masterVal: `${m.rules_count} rules`,
-                targetVal: `${t.rules_count} rules`,
-                type: 'changed'
-              });
-            }
-          }
-        });
-
-        tList.forEach(t => {
-          if (!mMap.has(t.url)) {
-            diffs.push({
-              name: t.name,
-              masterVal: 'Missing',
-              targetVal: 'Present',
-              type: 'extra'
-            });
-          }
-        });
-      };
-
-      compareLists('Blocklists', getFilters(masterSettings, 'filters'), getFilters(targetSettings, 'filters'));
-      compareLists('Whitelists', getFilters(masterSettings, 'whitelist_filters'), getFilters(targetSettings, 'whitelist_filters'));
-    }
-
-    // Rewrites Comparison
-    else if (category === 'rewrites') {
-      const mRewrites = (Array.isArray(masterData) ? masterData : []) as { domain: string, answer: string }[];
-      const tRewrites = (Array.isArray(targetData) ? targetData : []) as { domain: string, answer: string }[];
-      const mSet = new Set(mRewrites.map(r => `${r.domain}→${r.answer}`));
-      const tSet = new Set(tRewrites.map(r => `${r.domain}→${r.answer}`));
-
-      mRewrites.forEach(r => {
-        if (!tSet.has(`${r.domain}→${r.answer}`)) {
-          diffs.push({ name: r.domain, masterVal: r.answer, targetVal: 'Missing', type: 'missing' });
-        }
-      });
-      tRewrites.forEach(r => {
-        if (!mSet.has(`${r.domain}→${r.answer}`)) {
-          diffs.push({ name: r.domain, masterVal: 'Missing', targetVal: r.answer, type: 'extra' });
-        }
-      });
-    }
-
-    // Blocked Services Comparison
-    else if (category === 'blockedServices') {
-      // Handle both array format and object format { ids: [...] }
-      const getIds = (d: SettingsValue): string[] => {
-        if (Array.isArray(d)) return d as string[];
-        if (d && typeof d === 'object' && 'ids' in (d as Record<string, unknown>)) return ((d as Record<string, unknown>).ids as string[]) || [];
-        return [];
-      };
-
-      const mIds = new Set(getIds(masterData));
-      const tIds = new Set(getIds(targetData));
-
-      mIds.forEach(id => {
-        if (!tIds.has(id)) diffs.push({ name: id, masterVal: 'Blocked', targetVal: 'Allowed', type: 'missing' });
-      });
-      tIds.forEach(id => {
-        if (!mIds.has(id)) diffs.push({ name: id, masterVal: 'Allowed', targetVal: 'Blocked', type: 'extra' });
-      });
-    }
-
-    // Generic Settings Comparison (DNS, Stats, QueryLog, AccessList)
-    else {
-      if (typeof masterData === 'object' && masterData !== null && typeof targetData === 'object' && targetData !== null && !Array.isArray(masterData)) {
-        const m = masterData as Record<string, SettingsValue>;
-        const t = targetData as Record<string, SettingsValue>;
-
-        // Check only keys present in master
-        Object.keys(m).forEach(key => {
-          if (['id', 'last_updated', 'default_local_ptr_upstreams'].includes(key)) return;
-          if (!areSettingsEqual(m[key], t[key])) {
-            diffs.push({
-              name: key,
-              masterVal: JSON.stringify(m[key]),
-              targetVal: t[key] === undefined ? 'Missing' : JSON.stringify(t[key]),
-              type: 'setting'
-            });
-          }
-        });
-      }
-    }
-
-    if (diffs.length === 0) return null;
-
-    return (
-      <div className="p-3 space-y-2">
-        {diffs.map((diff, idx) => (
-          <div key={idx} className={`p-3 rounded-lg border ${diff.type === 'setting' ? 'border-blue-500/30 bg-blue-500/5' :
-            diff.type === 'missing' ? 'border-yellow-500/30 bg-yellow-500/5' :
-              diff.type === 'extra' ? 'border-red-500/30 bg-red-500/5' :
-                'border-orange-500/30 bg-orange-500/5'
-            }`}>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-white text-sm font-medium">{diff.name}</span>
-              <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${diff.type === 'setting' ? 'bg-blue-500/20 text-blue-400' :
-                diff.type === 'missing' ? 'bg-yellow-500/20 text-yellow-400' :
-                  diff.type === 'extra' ? 'bg-red-500/20 text-red-400' :
-                    'bg-orange-500/20 text-orange-400'
-                }`}>{diff.type.toUpperCase()}</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="p-2 rounded bg-[#0F1115]"><span className="text-gray-500">Master:</span> <span className="text-[var(--primary)] block truncate">{diff.masterVal}</span></div>
-              <div className="p-2 rounded bg-[#181A20]"><span className="text-gray-500">Target:</span> <span className={`${diff.type === 'missing' ? 'text-yellow-400' : diff.type === 'extra' ? 'text-red-400' : 'text-orange-400'
-                } block truncate`}>{diff.targetVal}</span></div>
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  };
-
-  const ComparisonCard = ({ ip, settings }: { ip: string, settings: { settings?: Settings; errors?: Record<string, string> } }) => {
-    const expandedCategory = expandedCategories[ip] || null;
-    const setExpandedCategory = (value: string | null) => {
-      setExpandedCategories(prev => ({ ...prev, [ip]: value }));
-    };
-
-    if (!masterSettings) return null;
-
-    const SYNCABLE_KEYS = ['filtering', 'querylogConfig', 'statsConfig', 'dnsSettings', 'rewrites', 'blockedServices', 'accessList'];
-
-    if (!settings || (!settings.settings && settings.errors)) {
-      return (
-        <div className="adguard-card border-yellow-500/30">
-          <h3 className="font-mono text-white text-lg mb-2">{ip}</h3>
-          <p className="text-red-400 font-medium mb-2">Error fetching settings</p>
-          <div className="text-xs text-gray-500">
-            {settings.errors ? Object.entries(settings.errors).map(([k, v]) => <div key={k}><strong>{k}:</strong> {v}</div>) : 'No details.'}
-          </div>
-        </div>
-      );
-    }
-
-    const targetSettings = settings.settings as Settings;
-    const differences = SYNCABLE_KEYS.filter(key => {
-      const m = (masterSettings as Settings)[key];
-      const r = (targetSettings as Settings)[key];
-      const bothMissing = (m === undefined || m === null) && (r === undefined || r === null);
-      if (bothMissing) return false;
-      return !areSettingsEqual(m, r);
-    });
-
-    const isSynced = differences.length === 0;
-
-    return (
-      <div className={`adguard-card ${isSynced ? 'border-[var(--primary)]/30' : 'border-red-500/30'}`}>
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="font-mono text-white text-lg">{ip}</h3>
-          <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${isSynced
-            ? 'bg-[var(--primary)]/10 text-[var(--primary)] border border-[var(--primary)]/30'
-            : 'bg-red-500/10 text-red-400 border border-red-500/30'
-            }`}>
-            {isSynced ? <Check className="w-3 h-3" /> : <AlertCircle className="w-3 h-3" />}
-            {isSynced ? 'In Sync' : 'Out of Sync'}
-          </span>
-        </div>
-
-        {!isSynced && (
-          <div className="space-y-2">
-            {differences.map(key => {
-              const syncKey = `${ip}:${key}`;
-              const isSyncing = syncing === syncKey;
-              const isExpanded = expandedCategory === key;
-              return (
-                <div key={key} className="rounded-lg border border-[#2A2D35] overflow-hidden">
-                  <div className="flex justify-between items-center p-3 bg-[#0F1115]">
-                    <button
-                      onClick={() => setExpandedCategory(isExpanded ? null : key)}
-                      className="flex-grow text-left flex items-center gap-2 text-gray-300 hover:text-white transition-colors"
-                    >
-                      {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                      <span className="font-medium">{key}</span>
-                    </button>
-                    <button
-                      onClick={() => handleSync(ip, key)}
-                      disabled={isSyncing || (autoSyncRunning && !autoSyncPaused)}
-                      className="px-3 py-1.5 text-xs font-medium text-[var(--primary)] border border-[var(--primary)]/30 rounded-lg hover:bg-[var(--primary)]/10 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {isSyncing ? 'Syncing...' : 'Sync'}
-                    </button>
-                  </div>
-                  {isExpanded && (
-                    <DiffDisplay
-                      category={key}
-                      masterData={masterSettings[key]}
-                      targetData={targetSettings[key]}
-                    />
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const uniqueReplicas = Array.from(new Set(autoSyncLogs.map(log => log.replicaId)));
-  const uniqueCategories = Array.from(new Set(autoSyncLogs.map(log => log.category)));
-  const successCount = autoSyncLogs.filter(log => log.status === 'success').length;
-  const successRate = autoSyncLogs.length > 0 ? ((successCount / autoSyncLogs.length) * 100).toFixed(1) : '0';
+  const successRate = autoSyncLogs.length > 0
+    ? ((autoSyncLogs.filter(l => l.status === 'success').length / autoSyncLogs.length) * 100).toFixed(0)
+    : '—';
 
   return (
-    <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto w-full relative">
-      {/* Notification */}
-      {notification && (
-        <div className={`fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-3 rounded-lg shadow-lg z-50 flex items-center gap-3 ${notification.type === 'success'
-          ? 'bg-[var(--primary)]/20 text-[var(--primary)] border border-[var(--primary)]/30'
-          : 'bg-red-500/20 text-red-400 border border-red-500/30'
-          }`}>
-          {notification.message}
-          <button onClick={() => setNotification(null)} className="hover:opacity-70"><X className="w-4 h-4" /></button>
-        </div>
-      )}
+    <div className="space-y-5">
+      <PageHeader
+        title="Sync Status"
+        description={
+          masterServerId
+            ? <>Comparing every replica against <span className="font-mono text-[var(--text-muted)]">{masterServerId}</span>.</>
+            : 'No master server selected yet.'
+        }
+        actions={
+          tab === 'status' ? (
+            <Button
+              size="sm"
+              onClick={fetchAllSettings}
+              disabled={isLoading}
+              icon={<RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />}
+            >
+              Refresh
+            </Button>
+          ) : undefined
+        }
+      />
 
-      <LogViewerModal show={showLogModal} title={logModalTitle} logs={syncLogs} onClose={() => setShowLogModal(false)} />
+      <Segmented
+        label="Sync view"
+        value={tab}
+        onChange={setTab}
+        options={[
+          { value: 'status', label: 'Drift', icon: <GitCompare className="h-3.5 w-3.5" /> },
+          { value: 'history', label: 'Auto-sync history', icon: <History className="h-3.5 w-3.5" /> },
+        ]}
+      />
 
-      {/* Header */}
-      <header className="mb-6">
-        <h1 className="text-3xl font-bold text-white tracking-tight">Sync Status</h1>
-        <p className="text-sm text-gray-500 mt-1">
-          Comparing all servers against master: <span className="text-[var(--primary)] font-mono">{masterServerIp || 'Not Set'}</span>
-        </p>
-      </header>
-
-      {/* Tabs */}
-      <div className="flex gap-3 mb-6">
-        <button
-          onClick={() => setActiveTab('status')}
-          className={`px-4 py-2 rounded-lg font-medium transition-all flex items-center gap-2 ${activeTab === 'status'
-            ? 'text-[var(--primary)] bg-[var(--primary)]/10 border border-[var(--primary)]/30'
-            : 'text-gray-400 border border-[#2A2D35] hover:border-gray-500'
-            }`}
-        >
-          <GitCompare className="w-4 h-4" />
-          Manual Sync Status
-        </button>
-        <button
-          onClick={() => setActiveTab('auto-sync')}
-          className={`px-4 py-2 rounded-lg font-medium transition-all flex items-center gap-2 ${activeTab === 'auto-sync'
-            ? 'text-[var(--primary)] bg-[var(--primary)]/10 border border-[var(--primary)]/30'
-            : 'text-gray-400 border border-[#2A2D35] hover:border-gray-500'
-            }`}
-        >
-          <History className="w-4 h-4" />
-          Auto-Sync History
-          {autoSyncRunning && <span className="w-2 h-2 bg-[var(--primary)] rounded-full animate-pulse" />}
-        </button>
-      </div>
-
-      {/* Manual Sync Tab */}
-      {activeTab === 'status' && (
+      {tab === 'status' && (
         <>
-          {/* Warning Banner */}
+          {error && <Alert tone="danger">{error}</Alert>}
+
           {autoSyncRunning && !autoSyncPaused && (
-            <div className="mb-6 p-4 rounded-lg bg-yellow-500/10 border border-yellow-500/30 flex items-start gap-3">
-              <Pause className="w-5 h-5 text-yellow-500 flex-shrink-0 mt-0.5" />
-              <div>
-                <h3 className="text-yellow-500 font-medium">Auto-Sync Active - Manual Sync Disabled</h3>
-                <p className="text-gray-400 text-sm mt-1">Pause or disable auto-sync in Settings to use manual sync.</p>
-              </div>
-            </div>
+            <Alert tone="warning" title="Auto-sync is active">
+              Manual sync is disabled while the scheduler runs. Pause it in Settings to sync by hand.
+            </Alert>
           )}
 
-          {isLoading && <div className="text-center py-12 text-[var(--primary)]">Loading server settings...</div>}
-          {error && <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400">{error}</div>}
+          {!masterServerId && !connectionsLoading && (
+            <Card>
+              <EmptyState
+                icon={<Server className="h-5 w-5" />}
+                title="No master server selected"
+                description="Mark one connection as master in Settings to compare the others against it."
+              />
+            </Card>
+          )}
 
-          {!isLoading && !error && (
-            <div className="space-y-6">
-              {Object.entries(replicaSettings).map(([ip, settings]) => (
-                <ComparisonCard key={ip} ip={ip} settings={settings} />
-              ))}
-              {Object.keys(replicaSettings).length === 0 && (
-                <div className="text-center py-12 text-gray-500">No replica servers found.</div>
-              )}
-            </div>
+          {masterServerId && (
+            isLoading && replicaEntries.length === 0 ? (
+              <div className="space-y-4">
+                <CardSkeleton rows={3} height={120} />
+                <CardSkeleton rows={3} height={120} />
+              </div>
+            ) : replicaEntries.length === 0 ? (
+              <Card>
+                <EmptyState
+                  icon={<ShieldCheck className="h-5 w-5" />}
+                  title="No replicas configured"
+                  description="Add a second connection in Settings to start comparing configurations."
+                />
+              </Card>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+                  <StatTile
+                    label="Replicas"
+                    value={replicaEntries.length}
+                    icon={<Server className="h-4 w-4" />}
+                    tone="neutral"
+                  />
+                  <StatTile
+                    label="In sync"
+                    value={inSyncCount}
+                    icon={<Check className="h-4 w-4" />}
+                    tone="success"
+                  />
+                  <StatTile
+                    label="Out of sync"
+                    value={replicaEntries.length - inSyncCount}
+                    icon={<AlertCircle className="h-4 w-4" />}
+                    tone={replicaEntries.length - inSyncCount > 0 ? 'danger' : 'neutral'}
+                  />
+                  <StatTile
+                    label="Next auto-sync"
+                    value={autoSyncConfig?.enabled ? untilTime(nextSync) : 'Off'}
+                    icon={<RefreshCw className="h-4 w-4" />}
+                    tone="info"
+                  />
+                </div>
+
+                <div className="space-y-4">
+                  {replicaEntries.map(([id, state]) => (
+                    <ReplicaCard
+                      key={id}
+                      id={id}
+                      state={state}
+                      masterSettings={masterSettings}
+                      expandedCategory={expanded[id] ?? null}
+                      onExpand={category => setExpanded(current => ({ ...current, [id]: category }))}
+                      syncingKey={syncingKey}
+                      onSync={runSync}
+                      syncDisabled={autoSyncRunning && !autoSyncPaused}
+                    />
+                  ))}
+                </div>
+              </>
+            )
           )}
         </>
       )}
 
-      {/* Auto-Sync History Tab */}
-      {activeTab === 'auto-sync' && (
-        <div className="space-y-6">
-          {/* Status Overview */}
-          <div className="adguard-card">
-            <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-              <Clock className="w-5 h-5" />
-              Auto-Sync Status
-            </h2>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-              <div className="p-4 rounded-lg bg-[#0F1115] border border-[#2A2D35]">
-                <p className="text-xs text-gray-500 uppercase tracking-wider">Status</p>
-                <p className="text-[var(--primary)] font-bold text-lg">
-                  {autoSyncPaused ? '⏸ Paused' : autoSyncRunning ? '✓ Active' : '○ Inactive'}
-                </p>
-              </div>
-              <div className="p-4 rounded-lg bg-[#0F1115] border border-[#2A2D35]">
-                <p className="text-xs text-gray-500 uppercase tracking-wider">Last Sync</p>
-                <p className="text-[var(--primary)] font-bold text-lg">{formatTimeAgo(autoSyncConfig?.lastSync || null)}</p>
-              </div>
-              <div className="p-4 rounded-lg bg-[#0F1115] border border-[#2A2D35]">
-                <p className="text-xs text-gray-500 uppercase tracking-wider">Next Sync</p>
-                <p className="text-[var(--primary)] font-bold text-lg">{formatNextSync(nextSyncTime)}</p>
-              </div>
-              <div className="p-4 rounded-lg bg-[#0F1115] border border-[#2A2D35]">
-                <p className="text-xs text-gray-500 uppercase tracking-wider">Success Rate</p>
-                <p className="text-[var(--primary)] font-bold text-lg">{successRate}%</p>
+      {tab === 'history' && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <StatTile
+              label="Scheduler"
+              value={autoSyncPaused ? 'Paused' : autoSyncRunning ? 'Active' : 'Inactive'}
+              icon={<Play className="h-4 w-4" />}
+              tone={autoSyncPaused ? 'warning' : autoSyncRunning ? 'success' : 'neutral'}
+            />
+            <StatTile label="Last run" value={relativeTime(autoSyncConfig?.lastSync ?? null)} tone="neutral" />
+            <StatTile label="Next run" value={untilTime(nextSync)} tone="neutral" />
+            <StatTile
+              label="Success rate"
+              value={successRate}
+              unit={successRate === '—' ? undefined : '%'}
+              tone="accent"
+            />
+          </div>
+
+          <Card>
+            <CardHeader
+              title="Run now"
+              description="Runs the configured categories against every replica immediately."
+              actions={
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={triggerAutoSync}
+                  loading={isTriggering}
+                  disabled={!autoSyncConfig?.enabled || autoSyncPaused}
+                  icon={<Play className="h-4 w-4" />}
+                >
+                  Trigger sync
+                </Button>
+              }
+            />
+            {!autoSyncConfig?.enabled && (
+              <p className="text-[13px] text-[var(--text-subtle)]">
+                Auto-sync is disabled. Enable it in Settings to use this.
+              </p>
+            )}
+          </Card>
+
+          <Card flush>
+            <div className="px-5 pt-5">
+              <CardHeader
+                title={`Sync history (${filteredLogs.length})`}
+                description="Newest first, up to the last 50 runs."
+              />
+              <div className="mb-4 grid gap-3 md:grid-cols-3">
+                <Field label="Replica">
+                  {id => (
+                    <select id={id} value={filterReplica} onChange={e => setFilterReplica(e.target.value)}>
+                      <option value="all">All replicas</option>
+                      {Array.from(new Set(autoSyncLogs.map(l => l.replicaId))).map(replica => (
+                        <option key={replica} value={replica}>{replica}</option>
+                      ))}
+                    </select>
+                  )}
+                </Field>
+                <Field label="Category">
+                  {id => (
+                    <select id={id} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
+                      <option value="all">All categories</option>
+                      {Array.from(new Set(autoSyncLogs.map(l => l.category))).map(category => (
+                        <option key={category} value={category}>{CATEGORY_LABELS[category] ?? category}</option>
+                      ))}
+                    </select>
+                  )}
+                </Field>
+                <Field label="Status">
+                  {id => (
+                    <select
+                      id={id}
+                      value={filterStatus}
+                      onChange={e => setFilterStatus(e.target.value as 'all' | 'success' | 'error')}
+                    >
+                      <option value="all">All statuses</option>
+                      <option value="success">Success</option>
+                      <option value="error">Error</option>
+                    </select>
+                  )}
+                </Field>
               </div>
             </div>
 
-            <button
-              onClick={triggerAutoSync}
-              disabled={!autoSyncConfig?.enabled || isTriggering || autoSyncPaused}
-              className={`w-full py-3 rounded-lg font-medium transition-all flex items-center justify-center gap-2 ${!autoSyncConfig?.enabled || isTriggering || autoSyncPaused
-                ? 'bg-[#2A2D35] text-gray-500 cursor-not-allowed'
-                : 'bg-[var(--primary)] text-black hover:bg-[var(--primary-dark)]'
-                }`}
-            >
-              {isTriggering ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-              {isTriggering ? 'Triggering...' : 'Trigger Sync Now'}
-            </button>
-          </div>
-
-          {/* Filters */}
-          <div className="adguard-card">
-            <h3 className="text-white font-medium mb-4 flex items-center gap-2">
-              <Filter className="w-4 h-4" />
-              Filter Logs
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">Replica</label>
-                <select value={filterReplica} onChange={(e) => setFilterReplica(e.target.value)} className="w-full">
-                  <option value="all">All Replicas</option>
-                  {uniqueReplicas.map(r => <option key={r} value={r}>{r}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">Category</label>
-                <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} className="w-full">
-                  <option value="all">All Categories</option>
-                  {uniqueCategories.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">Status</label>
-                <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value as 'all' | 'success' | 'error')} className="w-full">
-                  <option value="all">All Statuses</option>
-                  <option value="success">Success</option>
-                  <option value="error">Error</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          {/* Sync History */}
-          <div className="adguard-card">
-            <h3 className="text-white font-medium mb-4">
-              Sync History ({filteredAutoSyncLogs.length} entries)
-            </h3>
-            {filteredAutoSyncLogs.length === 0 ? (
-              <p className="text-gray-500 text-center py-8">No sync logs match the current filters.</p>
+            {filteredLogs.length === 0 ? (
+              <EmptyState
+                icon={<History className="h-5 w-5" />}
+                title="No sync runs recorded"
+                description="Entries appear here once auto-sync has run at least once."
+              />
             ) : (
-              <div className="space-y-2 max-h-[500px] overflow-y-auto">
-                {filteredAutoSyncLogs.map((log, index) => (
-                  <div key={index} className={`p-3 rounded-lg border flex items-center justify-between ${log.status === 'success'
-                    ? 'bg-[#0F1115] border-[var(--primary)]/30'
-                    : 'bg-red-500/5 border-red-500/30'
-                    }`}>
-                    <div className="flex items-center gap-3">
-                      <span className={`text-xl ${log.status === 'success' ? 'text-[var(--primary)]' : 'text-red-400'}`}>
-                        {log.status === 'success' ? <Check className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
-                      </span>
-                      <div>
-                        <p className="text-white font-medium">{log.category} → {log.replicaId}</p>
-                        <p className="text-gray-500 text-sm">{log.message}</p>
+              <ul className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
+                {[...filteredLogs].reverse().map((log, index) => (
+                  <li key={index} className="flex items-start justify-between gap-4 px-5 py-3">
+                    <div className="flex min-w-0 gap-2.5">
+                      {log.status === 'success'
+                        ? <Check className="mt-0.5 h-4 w-4 flex-shrink-0 text-[var(--success)]" aria-hidden="true" />
+                        : <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-[var(--danger)]" aria-hidden="true" />}
+                      <div className="min-w-0">
+                        <p className="truncate text-[13px] text-[var(--text)]">
+                          {CATEGORY_LABELS[log.category] ?? log.category} → {log.replicaId}
+                        </p>
+                        <p className="mt-0.5 text-[12px] text-[var(--text-subtle)]">{log.message}</p>
                       </div>
                     </div>
-                    <div className="text-right text-xs text-gray-500">
+                    <div className="tabular flex-shrink-0 text-right text-[12px] text-[var(--text-subtle)]">
                       <p>{new Date(log.timestamp).toLocaleString()}</p>
-                      {log.duration && <p>{log.duration}ms</p>}
+                      {log.duration != null && <p>{log.duration} ms</p>}
                     </div>
-                  </div>
+                  </li>
                 ))}
-              </div>
+              </ul>
             )}
-          </div>
+          </Card>
         </div>
       )}
-    </main>
+
+      <Modal
+        open={syncModal !== null}
+        onClose={() => setSyncModal(null)}
+        title={syncModal?.title ?? ''}
+        subtitle={
+          syncModal?.running
+            ? 'Filter syncs can take a few minutes while the server downloads lists.'
+            : 'Finished'
+        }
+        size="lg"
+      >
+        <LogConsole lines={syncLog} running={syncModal?.running ?? false} />
+      </Modal>
+    </div>
+  );
+}
+
+function ReplicaCard({
+  id, state, masterSettings, expandedCategory, onExpand, syncingKey, onSync, syncDisabled,
+}: {
+  id: string;
+  state: ReplicaState;
+  masterSettings: Settings | null;
+  expandedCategory: string | null;
+  onExpand: (category: string | null) => void;
+  syncingKey: string | null;
+  onSync: (replicaId: string, category: string) => void;
+  syncDisabled: boolean;
+}) {
+  if (!state.settings) {
+    return (
+      <Card>
+        <CardHeader
+          title={<span className="font-mono">{id}</span>}
+          actions={<Badge tone="danger">Unreachable</Badge>}
+        />
+        <div className="space-y-1 text-[12px] text-[var(--text-subtle)]">
+          {state.errors
+            ? Object.entries(state.errors).map(([key, message]) => (
+                <div key={key}>
+                  <span className="text-[var(--text-muted)]">{key}:</span> {message}
+                </div>
+              ))
+            : 'No details available.'}
+        </div>
+      </Card>
+    );
+  }
+
+  const drift = masterSettings ? driftedCategories(masterSettings, state.settings) : [];
+  const inSync = drift.length === 0;
+
+  return (
+    <Card>
+      <CardHeader
+        title={<span className="font-mono">{id}</span>}
+        actions={
+          inSync
+            ? <Badge tone="success" icon={<Check className="h-3 w-3" />}>In sync</Badge>
+            : <Badge tone="danger" icon={<AlertCircle className="h-3 w-3" />}>{drift.length} differences</Badge>
+        }
+      />
+
+      {inSync ? (
+        <p className="text-[13px] text-[var(--text-subtle)]">
+          Every syncable category matches the master.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {drift.map(category => {
+            const key = `${id}:${category}`;
+            const isExpanded = expandedCategory === category;
+            const diffs = masterSettings
+              ? diffCategory(category, masterSettings[category], (state.settings as Settings)[category])
+              : [];
+
+            return (
+              <div key={category} className="overflow-hidden rounded-[var(--radius)] border border-[var(--border)]">
+                <div className="flex items-center justify-between gap-3 bg-[var(--surface-2)] px-3 py-2">
+                  <button
+                    type="button"
+                    onClick={() => onExpand(isExpanded ? null : category)}
+                    aria-expanded={isExpanded}
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left text-[13px] font-medium text-[var(--text)]"
+                  >
+                    {isExpanded
+                      ? <ChevronDown className="h-4 w-4 flex-shrink-0 text-[var(--text-subtle)]" aria-hidden="true" />
+                      : <ChevronRight className="h-4 w-4 flex-shrink-0 text-[var(--text-subtle)]" aria-hidden="true" />}
+                    <span className="truncate">{CATEGORY_LABELS[category] ?? category}</span>
+                    {diffs.length > 0 && <Badge tone="neutral">{diffs.length}</Badge>}
+                  </button>
+                  <Button
+                    size="sm"
+                    onClick={() => onSync(id, category)}
+                    loading={syncingKey === key}
+                    disabled={syncDisabled || syncingKey !== null}
+                  >
+                    Sync
+                  </Button>
+                </div>
+
+                {isExpanded && (
+                  <div className="space-y-2 p-3">
+                    {diffs.length === 0 ? (
+                      <p className="text-[12px] text-[var(--text-subtle)]">
+                        The category differs but no field-level detail is available.
+                      </p>
+                    ) : diffs.map((diff, index) => (
+                      <Panel key={index} className="!p-3">
+                        <div className="mb-2 flex items-center gap-2">
+                          <span className="truncate text-[13px] text-[var(--text)]">{diff.name}</span>
+                          <Badge tone={DIFF_TONE[diff.type]}>{diff.type}</Badge>
+                        </div>
+                        <div className="grid gap-2 text-[12px] sm:grid-cols-2">
+                          <div className="rounded-[var(--radius-sm)] bg-[var(--bg)] p-2">
+                            <span className="text-[var(--text-subtle)]">Master</span>
+                            <span className="mt-0.5 block truncate font-mono text-[var(--accent)]" title={diff.masterVal}>
+                              {diff.masterVal}
+                            </span>
+                          </div>
+                          <div className="rounded-[var(--radius-sm)] bg-[var(--bg)] p-2">
+                            <span className="text-[var(--text-subtle)]">Replica</span>
+                            <span className="mt-0.5 block truncate font-mono text-[var(--text-muted)]" title={diff.targetVal}>
+                              {diff.targetVal}
+                            </span>
+                          </div>
+                        </div>
+                      </Panel>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
   );
 }

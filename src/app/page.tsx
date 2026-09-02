@@ -1,96 +1,124 @@
 "use client";
-import Link from "next/link";
-import { LayoutDashboard, FileSearch, BarChart3, RefreshCw, Settings, ArrowRight } from "lucide-react";
 
-const quickLinks = [
+import Link from "next/link";
+import { ArrowRight, Plug, Star, LayoutDashboard } from "lucide-react";
+import { NAV_ITEMS } from "./components/Sidebar";
+import { Card, CardHeader } from "./components/ui";
+import { useConnections } from "./contexts/ConnectionsContext";
+
+const STEPS = [
   {
-    name: "Dashboard",
-    href: "/dashboard",
+    icon: Plug,
+    title: "Add your servers",
+    body: (
+      <>
+        Open <Link href="/settings" className="text-[var(--accent)] hover:underline">Settings</Link> and
+        add each AdGuard Home instance with its URL and credentials.
+      </>
+    ),
+  },
+  {
+    icon: Star,
+    title: "Pick a master",
+    body: <>Mark one server as master. Its configuration is the source of truth for every sync.</>,
+  },
+  {
     icon: LayoutDashboard,
-    description: "Monitor all your AdGuard Home instances"
-  },
-  {
-    name: "Query Log",
-    href: "/query-log",
-    icon: FileSearch,
-    description: "View and search DNS query history"
-  },
-  {
-    name: "Statistics",
-    href: "/statistics",
-    icon: BarChart3,
-    description: "Analyze traffic and blocking stats"
-  },
-  {
-    name: "Sync Status",
-    href: "/sync-status",
-    icon: RefreshCw,
-    description: "Check synchronization between servers"
-  },
-  {
-    name: "Settings",
-    href: "/settings",
-    icon: Settings,
-    description: "Configure connections and preferences"
+    title: "Monitor and sync",
+    body: (
+      <>
+        The <Link href="/dashboard" className="text-[var(--accent)] hover:underline">Dashboard</Link> shows
+        live status, and <Link href="/sync-status" className="text-[var(--accent)] hover:underline">Sync Status</Link> shows
+        what drifted from the master.
+      </>
+    ),
   },
 ];
 
 export default function Home() {
+  const { connections, isLoading } = useConnections();
+  const configured = !isLoading && connections.length > 0;
+
   return (
-    <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-5xl mx-auto w-full">
-      {/* Hero Section */}
-      <div className="text-center py-12">
-        <h1 className="text-4xl sm:text-5xl font-bold text-white tracking-tight mb-4">
-          Welcome to <span className="text-[var(--primary)]">AdGuard Buddy</span>
-        </h1>
-        <p className="text-lg text-gray-400 max-w-2xl mx-auto">
-          A powerful tool to manage and synchronize your AdGuard Home instances.
-          Monitor, control, and keep your network protection in sync.
+    <div className="space-y-6">
+      <section>
+        <h2 className="text-2xl font-semibold tracking-tight text-[var(--text)]">
+          AdGuard Buddy
+        </h2>
+        <p className="mt-1.5 max-w-2xl text-[13px] text-[var(--text-muted)]">
+          Monitor, control and synchronize several AdGuard Home instances from one place.
+          {configured && ` ${connections.length} server${connections.length === 1 ? '' : 's'} configured.`}
         </p>
+      </section>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {NAV_ITEMS.map(item => {
+          const Icon = item.icon;
+          return (
+            <Link
+              key={item.href}
+              href={item.href}
+              className="card group flex items-start gap-3.5 p-4 transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-2)]"
+            >
+              <span
+                className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-[var(--radius)]"
+                style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+                aria-hidden="true"
+              >
+                <Icon className="h-[18px] w-[18px]" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-medium text-[var(--text)]">
+                  {item.name}
+                  <ArrowRight
+                    className="h-3.5 w-3.5 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100"
+                    aria-hidden="true"
+                  />
+                </span>
+                <span className="mt-0.5 block text-[13px] text-[var(--text-subtle)]">
+                  {DESCRIPTIONS[item.href]}
+                </span>
+              </span>
+            </Link>
+          );
+        })}
       </div>
 
-      {/* Quick Navigation Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-8">
-        {quickLinks.map((link) => (
-          <Link
-            key={link.href}
-            href={link.href}
-            className="adguard-card group hover:border-[var(--primary)]/50 transition-all duration-300 hover:shadow-[0_0_30px_var(--primary-light)]"
-          >
-            <div className="flex items-start gap-4">
-              <div className="p-3 rounded-lg bg-[var(--primary)]/10 text-[var(--primary)] group-hover:bg-[var(--primary)]/20 transition-colors">
-                <link.icon className="w-6 h-6" />
-              </div>
-              <div className="flex-grow">
-                <h3 className="text-white font-semibold text-lg flex items-center gap-2">
-                  {link.name}
-                  <ArrowRight className="w-4 h-4 opacity-0 -ml-1 group-hover:opacity-100 group-hover:ml-0 transition-all" />
-                </h3>
-                <p className="text-gray-500 text-sm mt-1">{link.description}</p>
-              </div>
-            </div>
-          </Link>
-        ))}
-      </div>
-
-      {/* Getting Started */}
-      <div className="mt-12 adguard-card">
-        <h2 className="text-xl font-bold text-white mb-4">Getting Started</h2>
-        <ol className="space-y-3 text-gray-400">
-          <li className="flex items-start gap-3">
-            <span className="flex-shrink-0 w-6 h-6 rounded-full bg-[var(--primary)]/20 text-[var(--primary)] text-sm font-bold flex items-center justify-center">1</span>
-            <span>Go to <Link href="/settings" className="text-[var(--primary)] hover:underline">Settings</Link> and add your AdGuard Home connections</span>
-          </li>
-          <li className="flex items-start gap-3">
-            <span className="flex-shrink-0 w-6 h-6 rounded-full bg-[var(--primary)]/20 text-[var(--primary)] text-sm font-bold flex items-center justify-center">2</span>
-            <span>Set a master server for synchronization</span>
-          </li>
-          <li className="flex items-start gap-3">
-            <span className="flex-shrink-0 w-6 h-6 rounded-full bg-[var(--primary)]/20 text-[var(--primary)] text-sm font-bold flex items-center justify-center">3</span>
-            <span>View the <Link href="/dashboard" className="text-[var(--primary)] hover:underline">Dashboard</Link> to monitor all instances</span>
-          </li>
-        </ol>
-      </div>
-    </main>
+      {!configured && (
+        <Card>
+          <CardHeader title="Getting started" description="Three steps to a working setup." />
+          <ol className="space-y-4">
+            {STEPS.map((step, index) => {
+              const Icon = step.icon;
+              return (
+                <li key={step.title} className="flex gap-3.5">
+                  <span
+                    className="tabular flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-[12px] font-semibold"
+                    style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+                  >
+                    {index + 1}
+                  </span>
+                  <div className="min-w-0">
+                    <p className="flex items-center gap-1.5 text-[13px] font-medium text-[var(--text)]">
+                      <Icon className="h-3.5 w-3.5 text-[var(--text-subtle)]" aria-hidden="true" />
+                      {step.title}
+                    </p>
+                    <p className="mt-0.5 text-[13px] text-[var(--text-muted)]">{step.body}</p>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </Card>
+      )}
+    </div>
   );
 }
+
+const DESCRIPTIONS: Record<string, string> = {
+  '/dashboard': 'Live status and protection controls for every instance',
+  '/query-log': 'Search DNS queries across all servers',
+  '/statistics': 'Traffic, blocking and latency analysis',
+  '/sync-status': 'What drifted from the master, and one-click sync',
+  '/settings': 'Connections, auto-sync and appearance',
+};

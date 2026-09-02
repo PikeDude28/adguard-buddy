@@ -1,61 +1,29 @@
 import { GET } from '../route';
-import { promises as fs } from 'fs';
-import path from 'path';
+import { resolveAllConnections } from '@/lib/serverConnections';
 
-// Mock fs, path, and crypto
-jest.mock('fs', () => ({
-  promises: {
-    stat: jest.fn(),
-    readFile: jest.fn(),
-  },
-}));
-jest.mock('path', () => ({
-  join: jest.fn(),
-}));
-jest.mock('crypto-js', () => ({
-  AES: {
-    decrypt: jest.fn(),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  resolveAllConnections: jest.fn(),
 }));
 
-// Mock the logger
 jest.mock('../../../logger', () => ({
-  info: jest.fn(),
-  error: jest.fn(),
-  warn: jest.fn(),
+  __esModule: true,
+  default: { info: jest.fn(), error: jest.fn(), warn: jest.fn() },
 }));
 
-// Mock the httpRequest function
-jest.mock('../../../../lib/httpRequest', () => ({
-  httpRequest: jest.fn(),
-}));
+jest.mock('@/lib/httpRequest', () => ({ httpRequest: jest.fn() }));
 
-const mockFs = require('fs').promises;
-const mockPath = require('path');
-const mockCryptoJS = require('crypto-js');
-const { httpRequest } = require('../../../../lib/httpRequest');
+const { httpRequest } = require('@/lib/httpRequest');
 const mockHttpRequest = httpRequest as jest.MockedFunction<typeof httpRequest>;
+const mockResolveAll = resolveAllConnections as jest.MockedFunction<typeof resolveAllConnections>;
+
+/** Connections come back from the store already decrypted. */
+const resolved = (store: { connections: Array<Record<string, unknown>> }) =>
+  store.connections.map((conn) => ({ ...conn, password: 'decrypted-password' }));
 
 describe('/api/statistics/combined', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockPath.join.mockImplementation((...args: string[]) => {
-      if (args[0] === '/mock/cwd' && args[1] === '.data' && args[2] === 'connections.json') {
-        return '/mock/cwd/.data/connections.json';
-      }
-      return args.join('/');
-    });
-
-    // Mock process.cwd
-    Object.defineProperty(process, 'cwd', {
-      value: jest.fn(() => '/mock/cwd'),
-      writable: true,
-    });
-
-    process.env.NEXT_PUBLIC_ADGUARD_BUDUDY_ENCRYPTION_KEY = 'test-key';
   });
 
   it('should return combined statistics successfully', async () => {
@@ -98,11 +66,7 @@ describe('/api/statistics/combined', () => {
       top_upstreams_avg_time: [{ '8.8.8.8': 18 }],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockImplementation((opts: any) => {
       if (opts.url.includes('192.168.1.1')) {
@@ -155,11 +119,7 @@ describe('/api/statistics/combined', () => {
       top_upstreams_avg_time: [],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 200,
@@ -199,11 +159,7 @@ describe('/api/statistics/combined', () => {
       top_upstreams_avg_time: [],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue(''),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 200,
@@ -225,8 +181,7 @@ describe('/api/statistics/combined', () => {
       connections: [],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     const response = await GET();
     const result = await response.json();
@@ -247,11 +202,7 @@ describe('/api/statistics/combined', () => {
       ],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 500,
@@ -266,10 +217,9 @@ describe('/api/statistics/combined', () => {
     expect(result.message).toBe('Could not fetch stats from any server.');
   });
 
-  it('should handle missing connections file', async () => {
-    const error = new Error('File not found') as NodeJS.ErrnoException;
-    error.code = 'ENOENT';
-    mockFs.stat.mockRejectedValue(error);
+  it('should handle a missing connections file', async () => {
+    // readMigratedStore resolves to an empty store when the file is absent.
+    mockResolveAll.mockResolvedValue([]);
 
     const response = await GET();
     const result = await response.json();
@@ -278,7 +228,7 @@ describe('/api/statistics/combined', () => {
     expect(result.message).toBe('No connections configured.');
   });
 
-  it('should handle decryption failures gracefully', async () => {
+  it('still aggregates when a stored password could not be decrypted', async () => {
     const mockConnections = {
       connections: [
         {
@@ -300,11 +250,9 @@ describe('/api/statistics/combined', () => {
       top_upstreams_avg_time: [],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue(''), // Empty string = decryption failed
-    });
+    mockResolveAll.mockResolvedValue(
+      mockConnections.connections.map((conn) => ({ ...conn, password: '' })) as never,
+    );
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 200,
@@ -347,11 +295,7 @@ describe('/api/statistics/combined', () => {
       top_upstreams_avg_time: [],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockImplementation((opts: any) => {
       if (opts.url.includes('192.168.1.1')) {
@@ -388,11 +332,7 @@ describe('/api/statistics/combined', () => {
       ],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockRejectedValue(new Error('Network timeout'));
 
@@ -415,11 +355,7 @@ describe('/api/statistics/combined', () => {
       ],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 200,
@@ -472,11 +408,7 @@ describe('/api/statistics/combined', () => {
       ],
     };
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
+    mockResolveAll.mockResolvedValue(resolved(mockConnections) as never);
 
     mockHttpRequest.mockResolvedValue({
       statusCode: 200,

@@ -3,14 +3,12 @@ import fs from 'fs';
 import path from 'path';
 import { AutoSyncConfig, SyncLogEntry, SyncInterval } from '@/types/auto-sync';
 import logger from '../api/logger';
-import CryptoJS from 'crypto-js';
-import { getConnectionId, type Connection } from '@/lib/connectionUtils';
+import { getConnectionId } from '@/lib/connectionUtils';
+import { readMigratedStore, resolveAllConnections, type ResolvedConnection } from '@/lib/serverConnections';
 
 const CONFIG_FILE = path.join(process.cwd(), 'auto-sync-config.json');
 const LOGS_FILE = path.join(process.cwd(), 'logs', 'auto-sync-logs.json');
 const MAX_LOG_ENTRIES = 500;
-// Server-side: Use both NEXT_PUBLIC_ and non-prefixed env vars for compatibility
-const ENCRYPTION_KEY = process.env.ADGUARD_BUDDY_ENCRYPTION_KEY || process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY || "adguard-buddy-key";
 
 class AutoSyncScheduler {
   private task: ReturnType<typeof cron.schedule> | null = null;
@@ -97,42 +95,6 @@ class AutoSyncScheduler {
     }
   }
 
-  /**
-   * Decrypt password using CryptoJS
-   * Tries multiple encryption keys for backward compatibility
-   */
-  private decryptPassword(encryptedPassword: string): string {
-    // Try keys in order of preference
-    const keysToTry = [
-      ENCRYPTION_KEY, // Current configured key
-      "adguard-buddy-key", // Default fallback key
-      process.env.ADGUARD_BUDDY_ENCRYPTION_KEY || '',
-      process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY || ''
-    ].filter(key => key && key.length > 0); // Remove empty keys
-    
-    // Remove duplicates
-    const uniqueKeys = [...new Set(keysToTry)];
-    
-    for (const key of uniqueKeys) {
-      try {
-        const bytes = CryptoJS.AES.decrypt(encryptedPassword, key);
-        const decrypted = bytes.toString(CryptoJS.enc.Utf8);
-        
-        if (decrypted && decrypted.length > 0) {
-          logger.info(`Successfully decrypted password with key: ${key === ENCRYPTION_KEY ? 'ENCRYPTION_KEY' : key === "adguard-buddy-key" ? 'default fallback' : 'alternative key'}`);
-          return decrypted;
-        }
-      } catch {
-        // Try next key
-        continue;
-      }
-    }
-    
-    logger.error('Password decryption resulted in empty string - all encryption keys failed');
-    logger.error(`Tried ${uniqueKeys.length} different keys`);
-    return '';
-  }
-
   private async performSync(): Promise<void> {
     if (this.isCurrentlySyncing) {
       logger.info('Auto-sync already in progress, skipping this run');
@@ -151,65 +113,14 @@ class AutoSyncScheduler {
     try {
       logger.info('Starting auto-sync cycle');
       
-      // Get connections from file - using the correct path from the API
-      const connectionsFile = path.join(process.cwd(), '.data', 'connections.json');
-      logger.info(`Looking for connections file at: ${connectionsFile}`);
-      
-      if (!fs.existsSync(connectionsFile)) {
+      // Credentials are read and decrypted by the shared server-side store,
+      // which also normalizes a legacy masterServerIp and re-encrypts old
+      // ciphertext. The scheduler must not reimplement any of that.
+      const store = await readMigratedStore();
+      const masterServerIp = store.masterServerIp;
+
+      if (store.connections.length === 0) {
         logger.warn('No connections configured yet. Skipping auto-sync cycle.');
-        return;
-      }
-
-      const fileContent = fs.readFileSync(connectionsFile, 'utf-8');
-      logger.info(`Connections file read successfully, length: ${fileContent.length}`);
-      
-      const connectionsData = JSON.parse(fileContent);
-      const connections = connectionsData.connections;
-      let masterServerIp = connectionsData.masterServerIp;
-      
-      // IMPORTANT: Migrate masterServerIp to normalized format if needed
-      // This ensures consistency with the format used in settings/sync-status
-      if (masterServerIp && connections.length > 0) {
-        const masterExists = connections.some((conn: Connection) => getConnectionId(conn) === masterServerIp);
-        
-        if (!masterExists) {
-          logger.warn(`Master server ID "${masterServerIp}" doesn't match any connection - attempting migration`);
-          
-          // Try to find a matching connection by checking legacy formats
-          const matchedConn = connections.find((conn: Connection) => {
-            // Check if masterServerIp matches just the IP (old format)
-            if (conn.ip === masterServerIp) return true;
-            // Check if masterServerIp matches just the URL without normalization
-            if (conn.url === masterServerIp) return true;
-            // Check if it's an IP:port that matches
-            if (conn.ip && masterServerIp === `${conn.ip}:${conn.port || ''}`) return true;
-            return false;
-          });
-          
-          if (matchedConn) {
-            const oldMasterId = masterServerIp;
-            masterServerIp = getConnectionId(matchedConn);
-            logger.info(`Migrated master server ID from "${oldMasterId}" to "${masterServerIp}"`);
-            
-            // Save the migrated data back to file
-            try {
-              fs.writeFileSync(connectionsFile, JSON.stringify({
-                connections,
-                masterServerIp
-              }, null, 2));
-              logger.info('Successfully saved migrated connections data');
-            } catch (writeError) {
-              logger.error('Failed to save migrated data:', writeError);
-              // Continue anyway - use the migrated masterServerIp in memory
-            }
-          }
-        }
-      }
-      
-      logger.info(`Parsed connections: ${connections?.length || 0} servers, master: ${masterServerIp}`);
-
-      if (!connections || connections.length === 0) {
-        logger.warn('No connections found. Skipping auto-sync cycle.');
         return;
       }
 
@@ -218,31 +129,17 @@ class AutoSyncScheduler {
         return;
       }
 
-      // Decrypt passwords for all connections
-      // IMPORTANT: We decrypt here using the same logic as the frontend
-      // to ensure consistency with manual sync
-      const decryptedConnections = connections.map((conn: Connection) => {
-        const decryptedPassword = this.decryptPassword(conn.password);
-        const connId = getConnectionId(conn);
-        
-        if (!decryptedPassword || decryptedPassword.length === 0) {
-          logger.error(`Failed to decrypt password for connection: ${connId}`);
-          logger.error(`Encrypted password length: ${conn.password?.length || 0}`);
-          logger.error(`Encryption key source: ${process.env.ADGUARD_BUDDY_ENCRYPTION_KEY ? 'ADGUARD_BUDDY_ENCRYPTION_KEY' : process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY ? 'NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY' : 'default fallback'}`);
-        } else {
-          logger.info(`Successfully decrypted password for connection: ${connId} (length: ${decryptedPassword.length})`);
+      const decryptedConnections = await resolveAllConnections();
+      logger.info(`Loaded ${decryptedConnections.length} connections, master: ${masterServerIp}`);
+
+      for (const conn of decryptedConnections) {
+        if (!conn.password) {
+          logger.error(`Failed to decrypt password for connection: ${getConnectionId(conn)}`);
         }
-        
-        return {
-          ...conn,
-          password: decryptedPassword
-        };
-      });
-      
-      logger.info('Password decryption completed for all connections');
+      }
 
       // Filter replica connections (exclude master)
-      const replicaConns = decryptedConnections.filter((c: Connection) => getConnectionId(c) !== masterServerIp);
+      const replicaConns = decryptedConnections.filter((c: ResolvedConnection) => getConnectionId(c) !== masterServerIp);
 
       if (replicaConns.length === 0) {
         logger.info('No replica servers configured for auto-sync');
@@ -250,11 +147,11 @@ class AutoSyncScheduler {
       }
 
       // Find master connection
-      const masterConn = decryptedConnections.find((c: Connection) => getConnectionId(c) === masterServerIp);
+      const masterConn = decryptedConnections.find((c: ResolvedConnection) => getConnectionId(c) === masterServerIp);
 
       if (!masterConn) {
         logger.error(`Master server connection not found. Looking for: ${masterServerIp}`);
-        logger.error(`Available connections: ${decryptedConnections.map((c: Connection) => getConnectionId(c)).join(', ')}`);
+        logger.error(`Available connections: ${decryptedConnections.map((c: ResolvedConnection) => getConnectionId(c)).join(', ')}`);
         throw new Error('Master server connection not found');
       }
       

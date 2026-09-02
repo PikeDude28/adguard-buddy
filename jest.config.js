@@ -20,6 +20,7 @@ const customJestConfig = {
     '!src/**/*.test.{js,jsx,ts,tsx}',
     '!src/**/*.spec.{js,jsx,ts,tsx}',
     '!src/types/**/*.ts', // Exclude type definitions
+    '!src/test-utils/**', // Test helpers, not product code
   ],
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html', 'json'],

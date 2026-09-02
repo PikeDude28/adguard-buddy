@@ -6,6 +6,17 @@
  * IP addresses with ports or full URLs.
  */
 
+/**
+ * The parts of a connection that determine its identity. Accepting only these
+ * lets the id helpers work on records that do not carry a password - such as
+ * the browser-facing view or a not-yet-saved form entry.
+ */
+export type ConnectionIdentity = {
+  ip?: string;
+  url?: string;
+  port?: number;
+};
+
 export type Connection = {
   ip?: string;
   url?: string;
@@ -44,7 +55,7 @@ export type Connection = {
  * getConnectionId({ ip: "192.168.1.1", username: "admin", password: "..." })
  * // Returns: "192.168.1.1"
  */
-export function getConnectionId(conn: Connection): string {
+export function getConnectionId(conn: ConnectionIdentity): string {
   // Prefer URL over IP if both are present
   if (conn.url && conn.url.length > 0) {
     // Remove trailing slash for consistency
@@ -71,10 +82,10 @@ export function getConnectionId(conn: Connection): string {
  * const connections = [{ ip: "192.168.1.1", port: 80, ... }];
  * const conn = findConnectionById(connections, "192.168.1.1:80");
  */
-export function findConnectionById(
-  connections: Connection[],
+export function findConnectionById<T extends ConnectionIdentity>(
+  connections: T[],
   connectionId: string
-): Connection | undefined {
+): T | undefined {
   return connections.find(conn => getConnectionId(conn) === connectionId);
 }
 
@@ -93,7 +104,7 @@ export function findConnectionById(
  * getConnectionDisplayName({ ip: "192.168.1.1", port: 80, ... })
  * // Returns: "192.168.1.1:80"
  */
-export function getConnectionDisplayName(conn: Connection): string {
+export function getConnectionDisplayName(conn: ConnectionIdentity): string {
   if (conn.url && conn.url.length > 0) {
     return conn.url;
   }

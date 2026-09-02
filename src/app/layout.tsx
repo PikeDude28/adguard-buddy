@@ -2,8 +2,6 @@ import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { AppProviders } from "./components/AppProviders";
-import { SiteFooter } from "./components/SiteFooter";
-import { NavBar } from "./components/NavBar";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -28,15 +26,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
-      <body
-        className={`${inter.variable} ${jetbrainsMono.variable} font-sans antialiased bg-[#0F1115] text-gray-300 min-h-screen flex flex-col`}
-      >
-        <AppProviders>
-          <NavBar />
-          <main className="flex-grow">{children}</main>
-          <SiteFooter />
-        </AppProviders>
+    <html lang="en">
+      <body className={`${inter.variable} ${jetbrainsMono.variable} theme-green antialiased`}>
+        <AppProviders>{children}</AppProviders>
       </body>
     </html>
   );

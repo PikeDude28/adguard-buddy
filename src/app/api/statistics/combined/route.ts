@@ -1,20 +1,18 @@
 
 import { NextResponse } from "next/server";
-import { promises as fs } from 'fs';
-import path from 'path';
-import CryptoJS from "crypto-js";
 import logger from "../../logger";
-import { httpRequest } from '../../../lib/httpRequest';
+import { httpRequest } from "@/lib/httpRequest";
+import {
+    authHeaders,
+    buildBaseUrl,
+    resolveAllConnections,
+    type ResolvedConnection,
+} from "@/lib/serverConnections";
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 // Types
-type Connection = {
-    ip: string;
-    username: string;
-    password: string; // encrypted
-    port?: number;
-    url?: string;
-    allowInsecure?: boolean;
-};
 
 type TopArrayEntry = { [key: string]: number };
 
@@ -38,42 +36,16 @@ type StatsData = {
     top_upstreams_responses: TopArrayEntry[];
 };
 
-const dataFilePath = path.join(process.cwd(), '.data', 'connections.json');
-const encryptionKey = process.env.NEXT_PUBLIC_ADGUARD_BUDUDY_ENCRYPTION_KEY || "adguard-buddy-key";
-
-async function getConnections(): Promise<Connection[]> {
+async function fetchStatsForServer(connection: ResolvedConnection): Promise<StatsData | null> {
     try {
-        await fs.stat(dataFilePath);
-        const fileContent = await fs.readFile(dataFilePath, 'utf-8');
-        const data = JSON.parse(fileContent);
-        return data.connections || [];
-    } catch (error) {
-        const err = error as NodeJS.ErrnoException;
-        if (err.code === 'ENOENT') {
-            return [];
-        }
-        logger.error(`Failed to read connections file: ${err.message}`);
-        throw new Error('Failed to read connections file.');
-    }
-}
-
-async function fetchStatsForServer(connection: Connection): Promise<StatsData | null> {
-    try {
-        let decryptedPassword = "";
-        try {
-            decryptedPassword = CryptoJS.AES.decrypt(connection.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-        } catch {
-            // Ignore decryption errors for now, maybe the password is not encrypted
-        }
-
-        const base = connection.url && connection.url.length > 0 ? connection.url.replace(/\/$/, '') : `http://${connection.ip}:${connection.port || 80}`;
+        const base = buildBaseUrl(connection);
         const statsUrl = `${base}/control/stats`;
-        const headers: Record<string, string> = {};
-        if (connection.username && decryptedPassword) {
-            headers["Authorization"] = "Basic " + Buffer.from(`${connection.username}:${decryptedPassword}`).toString("base64");
-        }
-
-        const r = await httpRequest({ method: 'GET', url: statsUrl, headers, allowInsecure: connection.allowInsecure });
+        const r = await httpRequest({
+            method: 'GET',
+            url: statsUrl,
+            headers: authHeaders(connection),
+            allowInsecure: connection.allowInsecure,
+        });
         if (r.statusCode < 200 || r.statusCode >= 300) {
             logger.warn(`Failed to fetch stats from ${connection.ip || connection.url || 'unknown'}: ${r.statusCode}`);
             return null;
@@ -99,7 +71,7 @@ async function fetchStatsForServer(connection: Connection): Promise<StatsData | 
             time_units: data.time_units || 'hours',
         };
     } catch (error) {
-        logger.error(`Error fetching stats from ${connection.ip}: ${error instanceof Error ? error.message : String(error)}`);
+        logger.error(`Error fetching stats from ${connection.url || connection.ip}: ${error instanceof Error ? error.message : String(error)}`);
         return null;
     }
 }
@@ -227,7 +199,7 @@ function aggregateStats(statsList: StatsData[]): StatsData {
 export async function GET() {
     logger.info("GET /statistics/combined called");
     try {
-        const connections = await getConnections();
+        const connections = await resolveAllConnections();
         if (connections.length === 0) {
             return NextResponse.json({ message: "No connections configured." }, { status: 404 });
         }

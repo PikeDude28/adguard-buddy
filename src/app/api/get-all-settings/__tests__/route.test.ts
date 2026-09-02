@@ -1,198 +1,67 @@
 import { POST } from '../route';
-import { NextRequest } from 'next/server';
+import { httpRequest } from '@/lib/httpRequest';
+import { resolveConnection } from '@/lib/serverConnections';
 
-// Mock the logger
+jest.mock('@/lib/httpRequest');
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  resolveConnection: jest.fn(),
+}));
 jest.mock('../../logger', () => ({
-  info: jest.fn(),
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-// Mock the httpRequest function
-jest.mock('../../../lib/httpRequest', () => ({
-  httpRequest: jest.fn(),
-}));
-
-const { httpRequest } = require('../../../lib/httpRequest');
 const mockHttpRequest = httpRequest as jest.MockedFunction<typeof httpRequest>;
+const mockResolve = resolveConnection as jest.MockedFunction<typeof resolveConnection>;
+const request = (body: unknown) => ({ json: async () => body }) as never;
 
-describe('/api/get-all-settings', () => {
+describe('POST /api/get-all-settings', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockResolve.mockResolvedValue({ ip: '10.0.0.5', port: 80, username: 'admin', password: 'pw' });
   });
 
-  it('should fetch all settings successfully', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-        username: 'admin',
-        password: 'password',
-        allowInsecure: false,
-      }),
-    } as unknown as NextRequest;
+  it('collects every endpoint into settings', async () => {
+    mockHttpRequest.mockResolvedValue({ statusCode: 200, headers: {}, body: '{"ok":true}' });
 
-    // Mock successful responses for all endpoints
-    mockHttpRequest.mockImplementation((opts: any) => {
-      const mockResponse = {
-        statusCode: 200,
-        headers: {},
-        body: JSON.stringify({ success: true }),
-      };
-      return Promise.resolve(mockResponse);
-    });
+    const data = await (await POST(request({ connectionId: '10.0.0.5:80' }))).json();
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.settings).toBeDefined();
-    expect(result.errors).toBeDefined();
-    expect(Object.keys(result.settings)).toHaveLength(13); // All endpoints should be present
-    expect(Object.keys(result.errors)).toHaveLength(0); // No errors expected
+    expect(Object.keys(data.settings)).toEqual(expect.arrayContaining([
+      'status', 'filtering', 'dnsSettings', 'rewrites', 'blockedServices', 'accessList',
+    ]));
+    expect(data.errors).toEqual({});
   });
 
-  it('should handle mixed success and failure responses', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-      }),
-    } as unknown as NextRequest;
+  it('records per-endpoint failures without failing the whole request', async () => {
+    mockHttpRequest.mockImplementation(async ({ url }) =>
+      url.includes('/control/tls/status')
+        ? { statusCode: 500, headers: {}, body: '' }
+        : { statusCode: 200, headers: {}, body: '{}' });
 
-    // Mock mixed responses - some succeed, some fail
-    let callCount = 0;
-    mockHttpRequest.mockImplementation((opts: any) => {
-      callCount++;
-      if (callCount % 2 === 0) {
-        return Promise.resolve({
-          statusCode: 200,
-          headers: {},
-          body: JSON.stringify({ success: true }),
-        });
-      } else {
-        return Promise.resolve({
-          statusCode: 500,
-          headers: {},
-          body: 'Internal Server Error',
-        });
-      }
-    });
+    const data = await (await POST(request({ connectionId: '10.0.0.5:80' }))).json();
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.settings).toBeDefined();
-    expect(result.errors).toBeDefined();
-    expect(Object.keys(result.settings).length + Object.keys(result.errors).length).toBe(13);
+    expect(data.errors.tls).toBe('Failed with status 500');
+    expect(data.settings.status).toEqual({});
   });
 
-  it('should handle network errors', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-      }),
-    } as unknown as NextRequest;
+  it('strips the undocumented "enabled" field from rewrites', async () => {
+    mockHttpRequest.mockImplementation(async ({ url }) =>
+      url.includes('/control/rewrite/list')
+        ? { statusCode: 200, headers: {}, body: '[{"domain":"a.test","answer":"1.1.1.1","enabled":true}]' }
+        : { statusCode: 200, headers: {}, body: '{}' });
 
-    mockHttpRequest.mockRejectedValue(new Error('Network timeout'));
+    const data = await (await POST(request({ connectionId: '10.0.0.5:80' }))).json();
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.settings).toBeDefined();
-    expect(result.errors).toBeDefined();
-    expect(Object.keys(result.errors)).toHaveLength(13); // All endpoints should have errors
+    expect(data.settings.rewrites).toEqual([{ domain: 'a.test', answer: '1.1.1.1' }]);
   });
 
-  it('should handle invalid JSON in request', async () => {
-    const mockRequest = {
-      json: jest.fn().mockRejectedValue(new Error('Invalid JSON')),
-    } as unknown as NextRequest;
-
-    await expect(POST(mockRequest)).rejects.toThrow('Invalid JSON');
+  it('rejects a missing connectionId', async () => {
+    expect((await POST(request({}))).status).toBe(400);
   });
 
-  it('should handle invalid JSON in responses gracefully', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-      }),
-    } as unknown as NextRequest;
-
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: 'invalid json response',
-    });
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.settings).toBeDefined();
-    // Should contain the raw body when JSON parsing fails
-    expect(typeof result.settings.status).toBe('string');
-  });
-
-  it('should use URL when provided instead of IP', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        url: 'http://adguard.example.com',
-        username: 'admin',
-        password: 'password',
-      }),
-    } as unknown as NextRequest;
-
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    // Verify that httpRequest was called with the correct URL
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: expect.stringContaining('http://adguard.example.com'),
-        headers: expect.objectContaining({
-          Authorization: expect.any(String),
-        }),
-      })
-    );
-  });
-
-  it('should include proper headers in requests', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-        username: 'admin',
-        password: 'password',
-      }),
-    } as unknown as NextRequest;
-
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
-
-    await POST(mockRequest);
-
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          'User-Agent': 'curl/8.0.1',
-          'Accept': '*/*',
-          'Connection': 'close',
-          'Authorization': expect.any(String),
-        }),
-      })
-    );
+  it('returns 404 for an unknown connection', async () => {
+    mockResolve.mockResolvedValue(null);
+    expect((await POST(request({ connectionId: 'ghost' }))).status).toBe(404);
   });
 });

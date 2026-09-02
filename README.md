@@ -21,12 +21,11 @@ One server acts as the master, and its settings can be synchronized to the other
 
 ## 🚀 Features
 
-- Clean Next.js dashboard for AdGuard Home
-- API interface for AdGuard Home functions
-- Log and statistics visualization
-- Manage filtering rules and connections
-- Category synchronization
-- Dark/Light mode
+- Fleet dashboard with per-server status, protection toggles and 24h trend
+- Merged query log across all servers, with search and one-click block/unblock
+- Statistics with real per-hour history, no simulated data
+- Drift view against a master server, plus scheduled auto-sync
+- Server-side credential handling with optional HTTP Basic auth
 - Docker support
 
 ---
@@ -49,8 +48,15 @@ https://github.com/chrizzo84/adguard-buddy/pkgs/container/adguard-buddy
 
 ```bash
 docker build -t adguard-buddy .
-docker run -p 3000:3000 adguard-buddy
+docker run -p 3000:3000 \
+  -e ADGUARD_BUDDY_ENCRYPTION_KEY="your-strong-key" \
+  -v adguard-buddy-data:/app/.data \
+  -v adguard-buddy-logs:/app/logs \
+  adguard-buddy
 ```
+
+`/app/.data` holds your connections; mount it as a volume or the configuration
+is lost when the container is recreated.
 
 ---
 
@@ -83,20 +89,10 @@ pnpm pre-commit      # Run lint + test (for pre-commit hooks)
 ### Testing Overview
 
 - **Framework:** Jest with React Testing Library
-- **Coverage:** 76.45% overall (75%+ target achieved)
-- **Test Suites:** 29 test suites with 300 total tests
 - **CI/CD:** Automated testing on every push/PR
 
-### Coverage Breakdown
-
-| Component | Statements | Branches | Functions | Lines |
-|-----------|------------|----------|-----------|-------|
-| Components | 100% | 92.85% | 100% | 100% |
-| Library | 100% | 100% | 100% | 100% |
-| API Routes | 85.71% | 100% | 69.89% | 83.33% |
-| Dashboard | 56.12% | 70.58% | 61.11% | 57.29% |
-| Settings | 63.57% | 48.33% | 57.14% | 65.94% |
-| Query Log | 54.26% | 52.5% | 53.16% | 56.5% |
+Run `pnpm test:coverage` for the current numbers; `src/lib` (crypto, credential
+store, validation, settings diff) is the part worth keeping close to 100%.
 
 ### CI/CD Pipeline
 
@@ -117,30 +113,64 @@ The project uses GitHub Actions for automated testing and quality assurance:
 - `.github/workflows/quality.yml` - Code quality monitoring
 - `.github/workflows/performance.yml` - Performance and Lighthouse
 - `.github/workflows/docker-publish.yml` - Docker publishing
-## ⚙️ Environment Variables
 
-**Required:**
+---
 
-- `NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY` — Used to encrypt/decrypt AdGuard Home passwords stored in `.data/connections.json`. Set this in your environment for secure password handling. Example:
+## 🔐 Security
+
+AdGuard Buddy can disable protection and rewrite filter rules on every server it
+knows about, so treat the instance itself as a privileged admin surface.
+
+**Credentials never reach the browser.** Passwords are encrypted at rest with
+AES-256-GCM (scrypt-derived key) and decrypted only inside API routes. The
+browser addresses a server by its connection id; `/api/get-connections` returns
+no password field at all.
+
+**Enable authentication** unless the instance is on a fully trusted network:
 
 ```bash
-export NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY="your-strong-key"
+export ADGUARD_BUDDY_AUTH_USER="admin"
+export ADGUARD_BUDDY_AUTH_PASSWORD="a-long-random-password"
 ```
 
-If not set, defaults to `adguard-buddy-key` (not recommended for production).
+With both set, every route requires HTTP Basic auth. Leaving them unset keeps the
+app open, which is only appropriate behind another layer of access control.
+
+## ⚙️ Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ADGUARD_BUDDY_ENCRYPTION_KEY` | recommended | Encrypts AdGuard Home passwords in `.data/connections.json`. Defaults to `adguard-buddy-key`, which is not safe for real credentials. |
+| `ADGUARD_BUDDY_AUTH_USER` | optional | Username for HTTP Basic auth. Auth is off unless this and the password are both set. |
+| `ADGUARD_BUDDY_AUTH_PASSWORD` | optional | Password for HTTP Basic auth. |
+
+```bash
+export ADGUARD_BUDDY_ENCRYPTION_KEY="your-strong-key"
+```
+
+> **Migrating from `NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY`:** that variable was
+> embedded in the browser bundle, so the key it held should be considered public.
+> It is still read as a fallback and existing stored passwords are transparently
+> re-encrypted on first read, but rename it to `ADGUARD_BUDDY_ENCRYPTION_KEY` and
+> rotate your AdGuard Home passwords.
 
 ---
 
 ## 📋 API Endpoints
 
-The main API routes are located in `src/app/api/`:
+Routes that talk to an AdGuard Home instance take a `connectionId` — the
+normalized `url` or `ip:port` of a stored connection — and never credentials:
 
-- `/api/adguard-control` – Control AdGuard Home
-- `/api/query-log` – Query logs
-- `/api/statistics` – Fetch statistics
-- `/api/set-filtering-rule` – Set filtering rules
-- `/api/get-connections` – Show connections
-- ...and more
+- `/api/get-connections` – configured servers, without passwords
+- `/api/save-connections` – replace the server list (plaintext passwords in, ciphertext at rest)
+- `/api/check-adguard` – status + stats for one server
+- `/api/adguard-control` – toggle protection
+- `/api/query-log` – query log for one server
+- `/api/statistics`, `/api/statistics/combined` – per-server and aggregated stats
+- `/api/get-all-settings` – every settings endpoint for one server
+- `/api/set-filtering-rule` – add/remove a block rule (SSE progress)
+- `/api/sync-category` – push one category from master to a replica (SSE progress)
+- `/api/auto-sync-config`, `/api/auto-sync-pause`, `/api/auto-sync-trigger` – scheduler
 
 ---
 

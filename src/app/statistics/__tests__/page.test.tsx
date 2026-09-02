@@ -1,220 +1,131 @@
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { screen, waitFor, fireEvent } from '@testing-library/react';
 import StatisticsPage from '../page';
+import { useConnections } from '../../contexts/ConnectionsContext';
+import { connection, mockConnectionsValue, renderWithProviders } from '../../../test-utils';
 
-// Mock dependencies
-jest.mock('@/app/components/NavMenu', () => ({
-  __esModule: true,
-  default: () => <nav data-testid="nav-menu">Navigation</nav>,
+jest.mock('../../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
 }));
 
-// Mock crypto-js
-jest.mock('crypto-js', () => ({
-  AES: {
-    encrypt: jest.fn(() => 'encrypted-password'),
-    decrypt: jest.fn(() => ({
-      toString: jest.fn(() => 'decrypted-password'),
-    })),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
-}));
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
-// Mock fetch
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
+const STATS = {
+  num_dns_queries: 10000,
+  num_blocked_filtering: 2500,
+  num_replaced_safebrowsing: 30,
+  num_replaced_parental: 12,
+  avg_processing_time: 0.0123,
+  time_units: 'hours',
+  dns_queries: [100, 200, 300],
+  blocked_filtering: [10, 20, 30],
+  top_clients: [{ 'iphone.lan': 500 }, { 'desktop.lan': 300 }],
+  top_blocked_domains: [{ 'ads.example': 200 }],
+  top_queried_domains: [{ 'cdn.example': 900 }],
+  top_upstreams_avg_time: [{ '1.1.1.1': 0.015 }],
+};
+
+const jsonResponse = (json: unknown, ok = true, status = 200) =>
+  ({ ok, status, json: async () => json }) as unknown as Response;
 
 describe('StatisticsPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch.mockClear();
+    mockUseConnections.mockReturnValue(mockConnectionsValue());
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(STATS));
   });
 
-  it('renders the statistics page with navigation', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('requests single-server stats by connection id', async () => {
+    renderWithProviders(<StatisticsPage />);
 
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/statistics', expect.anything()));
+    const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ connectionId: '192.168.1.1:80' });
   });
 
-  it('fetches connections on mount', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('uses the combined endpoint in combined scope', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      mode: 'combined',
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections }),
-    });
+    renderWithProviders(<StatisticsPage />);
 
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/statistics/combined'));
   });
 
-  it('handles fetch connections error gracefully', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
+  it('renders the headline figures', async () => {
+    renderWithProviders(<StatisticsPage />);
 
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should still render the page even with fetch error
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    // The total also appears in the donut centre, hence getAllByText.
+    await waitFor(() => expect(screen.getAllByText('10,000').length).toBeGreaterThan(0));
+    expect(screen.getAllByText('2,500').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('25.0%').length).toBeGreaterThan(0);
+    expect(screen.getByText('42')).toBeInTheDocument();  // threats
+    expect(screen.getByText('12.3')).toBeInTheDocument(); // avg ms
   });
 
-  it('renders view mode selector', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('draws the time series with an accessible label', async () => {
+    renderWithProviders(<StatisticsPage />);
 
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render the page structure
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText(/Allowed and Blocked per hour/)).toBeInTheDocument());
   });
 
-  it('fetches combined statistics when view mode is combined', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('shows an empty state instead of inventing a time series', async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({
+      ...STATS, dns_queries: undefined, blocked_filtering: undefined,
+    }));
 
-    const mockStats = {
-      avg_processing_time: 0.5,
-      dns_queries: 1000,
-      top_queried_domains: [{ 'example.com': 100 }],
-      top_blocked_domains: [{ 'bad.com': 50 }],
-      top_clients: [{ '192.168.1.100': 200 }],
-      top_upstreams_avg_time: [{ '8.8.8.8': 0.3 }],
-    };
+    renderWithProviders(<StatisticsPage />);
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockStats),
-      });
-
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should be able to fetch combined stats
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No time series available')).toBeInTheDocument());
+    expect(screen.queryByLabelText(/per hour/)).not.toBeInTheDocument();
   });
 
-  it('fetches single server statistics when view mode is single', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('lists top clients and domains', async () => {
+    renderWithProviders(<StatisticsPage />);
 
-    const mockStats = {
-      avg_processing_time: 0.5,
-      dns_queries: 1000,
-      top_queried_domains: [{ 'example.com': 100 }],
-      top_blocked_domains: [{ 'bad.com': 50 }],
-      top_clients: [{ '192.168.1.100': 200 }],
-      top_upstreams_avg_time: [{ '8.8.8.8': 0.3 }],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockStats),
-      });
-
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should be able to fetch single server stats
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('iphone.lan')).toBeInTheDocument());
+    expect(screen.getByText('ads.example')).toBeInTheDocument();
+    expect(screen.getByText('cdn.example')).toBeInTheDocument();
   });
 
-  it('handles statistics fetch error gracefully', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('formats upstream times in milliseconds', async () => {
+    renderWithProviders(<StatisticsPage />);
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        json: () => Promise.resolve({ message: 'API Error' }),
-      });
-
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle API errors gracefully
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('15 ms')).toBeInTheDocument());
   });
 
-  it('shows loading state during data fetch', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('loads threat domains on demand only', async () => {
+    renderWithProviders(<StatisticsPage />);
+    await waitFor(() => expect(screen.getByText('Show domains')).toBeInTheDocument());
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce(new Promise(resolve => setTimeout(resolve, 100))); // Delay response
+    expect((global.fetch as jest.Mock).mock.calls.some(([url]) => String(url).includes('query-log')))
+      .toBe(false);
 
-    await act(async () => {
-      render(<StatisticsPage />);
-    });
+    (global.fetch as jest.Mock).mockResolvedValue(jsonResponse({
+      data: [{ question: { name: 'malware.test' }, time: '2026-01-01T00:00:00Z' }],
+    }));
+    fireEvent.click(screen.getByText('Show domains'));
 
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
+    await waitFor(() => expect(screen.getByText('malware.test')).toBeInTheDocument());
+  });
 
-    // Should handle loading states
-    expect(screen.getByRole('heading', { level: 1, name: /Network Traffic/i })).toBeInTheDocument();
+  it('surfaces a fetch error', async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ message: 'Server unreachable' }, false, 502));
+
+    renderWithProviders(<StatisticsPage />);
+
+    await waitFor(() => expect(screen.getByText('Server unreachable')).toBeInTheDocument());
+  });
+
+  it('shows an empty state when no connections exist', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [], selectedId: null, selected: null,
+    }));
+
+    renderWithProviders(<StatisticsPage />);
+
+    expect(screen.getByText('No connections configured')).toBeInTheDocument();
   });
 });

@@ -1,538 +1,139 @@
 import { POST } from '../route';
-import { promises as fs } from 'fs';
-import path from 'path';
-import CryptoJS from 'crypto-js';
+import { httpRequest } from '@/lib/httpRequest';
+import { resolveAllConnections } from '@/lib/serverConnections';
 
-// Mock fs, path, and crypto
-jest.mock('fs', () => ({
-  promises: {
-    stat: jest.fn(),
-    readFile: jest.fn(),
-  },
+jest.mock('@/lib/httpRequest');
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  resolveAllConnections: jest.fn(),
 }));
-jest.mock('path', () => ({
-  join: jest.fn(),
-}));
-jest.mock('crypto-js', () => ({
-  AES: {
-    decrypt: jest.fn(),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
+jest.mock('../../logger', () => ({
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-// Mock the httpRequest function
-jest.mock('../../../lib/httpRequest', () => ({
-  httpRequest: jest.fn(),
-}));
-
-const mockFs = require('fs').promises;
-const mockPath = require('path');
-const mockCryptoJS = require('crypto-js');
-const { httpRequest } = require('../../../lib/httpRequest');
 const mockHttpRequest = httpRequest as jest.MockedFunction<typeof httpRequest>;
+const mockResolveAll = resolveAllConnections as jest.MockedFunction<typeof resolveAllConnections>;
 
-describe('/api/set-filtering-rule', () => {
+const request = (body: unknown) => ({ json: async () => body }) as never;
+
+const CONNECTIONS = [
+  { ip: '10.0.0.1', port: 80, username: 'admin', password: 'pw1' },
+  { url: 'https://dns2.test', username: 'admin', password: 'pw2' },
+];
+
+/** Reads the SSE frames the route streamed back. */
+async function messages(response: Response): Promise<string[]> {
+  const stream = response.body as unknown as { events: () => Promise<{ message: string }[]> };
+  return (await stream.events()).map(event => event.message);
+}
+
+describe('POST /api/set-filtering-rule', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockPath.join.mockImplementation((...args: string[]) => {
-      if (args[0] === '/mock/cwd' && args[1] === '.data' && args[2] === 'connections.json') {
-        return '/mock/cwd/.data/connections.json';
-      }
-      return args.join('/');
-    });
-
-    // Mock process.cwd and environment
-    Object.defineProperty(process, 'cwd', {
-      value: jest.fn(() => '/mock/cwd'),
-      writable: true,
-    });
-    process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY = 'test-key';
+    mockResolveAll.mockResolvedValue(CONNECTIONS);
+    mockHttpRequest.mockResolvedValue({ statusCode: 200, headers: {}, body: '{"user_rules":[]}' });
   });
 
-  it('should return 400 when domain is missing', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
+  it('rejects a missing domain', async () => {
+    const response = await POST(request({ action: 'block' }));
     expect(response.status).toBe(400);
-    const result = await response.json();
-    expect(result.message).toBe('Domain and action are required.');
   });
 
-  it('should return 400 when action is missing', async () => {
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
+  it('rejects an invalid action', async () => {
+    const response = await POST(request({ domain: 'ads.test', action: 'nuke' }));
     expect(response.status).toBe(400);
-    const result = await response.json();
-    expect(result.message).toBe('Domain and action are required.');
   });
 
-  it('should process blocking rule successfully', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
-
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
-    expect(response.headers.get('Cache-Control')).toBe('no-cache');
-    expect(response.headers.get('Connection')).toBe('keep-alive');
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: JSON.stringify({ rules: ['||example.com^'] }),
-      })
-    );
+  it('rejects a domain containing rule syntax', async () => {
+    const response = await POST(request({ domain: '||evil^$important', action: 'block' }));
+    expect(response.status).toBe(400);
+    expect(mockHttpRequest).not.toHaveBeenCalled();
   });
 
-  it('should process allow rule successfully', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('adds a block rule while preserving existing rules', async () => {
+    mockHttpRequest.mockImplementation(async ({ url }) =>
+      url.includes('filtering/status')
+        ? { statusCode: 200, headers: {}, body: '{"user_rules":["||keep.test^"]}' }
+        : { statusCode: 200, headers: {}, body: '{}' });
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
+    await POST(request({ domain: 'ads.test', action: 'block', connectionIds: ['10.0.0.1:80'] }));
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'allow',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: JSON.stringify({ rules: ['@@||example.com^'] }),
-      })
-    );
+    const setCall = mockHttpRequest.mock.calls.find(([opts]) => opts.url.includes('set_rules'));
+    expect(JSON.parse(setCall![0].body as string)).toEqual({ rules: ['||keep.test^', '||ads.test^'] });
   });
 
-  it('should handle multiple connections', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin1',
-          password: 'encrypted-password1',
-          allowInsecure: false,
-        },
-        {
-          ip: '192.168.1.2',
-          port: 80,
-          username: 'admin2',
-          password: 'encrypted-password2',
-          allowInsecure: true,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('removes the opposing rule when switching to unblock', async () => {
+    mockHttpRequest.mockImplementation(async ({ url }) =>
+      url.includes('filtering/status')
+        ? { statusCode: 200, headers: {}, body: '{"user_rules":["||ads.test^","||other.test^"]}' }
+        : { statusCode: 200, headers: {}, body: '{}' });
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
+    await POST(request({ domain: 'ads.test', action: 'unblock', connectionIds: ['10.0.0.1:80'] }));
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    const setCall = mockHttpRequest.mock.calls.find(([opts]) => opts.url.includes('set_rules'));
+    expect(JSON.parse(setCall![0].body as string)).toEqual({ rules: ['||other.test^', '@@||ads.test^'] });
   });
 
-  it('should handle connection failures gracefully', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('skips writing when the rule already exists', async () => {
+    mockHttpRequest.mockResolvedValue({ statusCode: 200, headers: {}, body: '{"user_rules":["||ads.test^"]}' });
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockRejectedValue(new Error('Connection failed'));
+    const response = await POST(request({ domain: 'ads.test', action: 'block', connectionIds: ['10.0.0.1:80'] }));
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should still return SSE response even with failures
+    expect(await messages(response)).toContain('Rule already exists, skipping...');
   });
 
-  it('should handle decryption failures', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('applies to every connection when no ids are given', async () => {
+    const response = await POST(request({ domain: 'ads.test', action: 'block' }));
+    const log = await messages(response);
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue(''), // Empty string = decryption failed
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle decryption failure gracefully
+    expect(log[0]).toContain('on 2 server(s)');
+    expect(log).toContain('Successfully applied rule on 10.0.0.1:80');
+    expect(log).toContain('Successfully applied rule on https://dns2.test');
   });
 
-  it('should handle missing connections file', async () => {
-    const error = new Error('File not found') as NodeJS.ErrnoException;
-    error.code = 'ENOENT';
-    mockFs.stat.mockRejectedValue(error);
+  it('only touches the requested connections', async () => {
+    const response = await POST(request({
+      domain: 'ads.test', action: 'block', connectionIds: ['https://dns2.test'],
+    }));
+    const log = await messages(response);
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle empty connections gracefully
+    expect(log[0]).toContain('on 1 server(s)');
+    expect(log.some(line => line.includes('10.0.0.1'))).toBe(false);
   });
 
-  it('should handle connections with URLs', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          url: 'http://adguard.example.com',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
-
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: 'http://adguard.example.com/control/filtering/set_rules',
-      })
-    );
+  it('rejects a non-array connectionIds', async () => {
+    expect((await POST(request({ domain: 'a.test', action: 'block', connectionIds: 'all' }))).status).toBe(400);
   });
 
-  it('should handle non-ENOENT file system errors', async () => {
-    const error = new Error('Permission denied') as NodeJS.ErrnoException;
-    error.code = 'EACCES';
-    mockFs.stat.mockRejectedValue(error);
+  it('continues to the next server after a failure', async () => {
+    mockHttpRequest.mockImplementation(async ({ url }) => {
+      if (url.startsWith('http://10.0.0.1')) throw new Error('unreachable');
+      return { statusCode: 200, headers: {}, body: '{"user_rules":[]}' };
+    });
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
+    const log = await messages(await POST(request({ domain: 'ads.test', action: 'block' })));
 
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle file system errors gracefully by returning empty connections
+    expect(log.some(line => line.startsWith('Failed to apply rule on 10.0.0.1:80'))).toBe(true);
+    expect(log).toContain('Successfully applied rule on https://dns2.test');
+    expect(log[log.length - 1]).toBe('Finished.');
   });
 
-  it('should handle AdGuard API error with JSON response', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('reports a server whose password could not be decrypted', async () => {
+    mockResolveAll.mockResolvedValue([{ ip: '10.0.0.1', port: 80, username: 'admin', password: '' }]);
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 400,
-      headers: {},
-      body: JSON.stringify({ message: 'Invalid rule format' }),
-    });
+    const log = await messages(await POST(request({ domain: 'ads.test', action: 'block' })));
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should continue processing other connections even if one fails
+    expect(log.some(line => line.includes('Stored password could not be decrypted'))).toBe(true);
   });
 
-  it('should handle AdGuard API error without JSON response', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
+  it('reports a non-2xx filtering status', async () => {
+    mockHttpRequest.mockResolvedValue({ statusCode: 403, headers: {}, body: '' });
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    
-    // Mock httpRequest to return a response that will fail JSON parsing
-    const mockResponse = {
-      statusCode: 500,
-      headers: {},
-      body: '<html>Internal Server Error</html>', // HTML response that can't be parsed as JSON
-    };
-    mockHttpRequest.mockResolvedValue(mockResponse);
+    const log = await messages(await POST(request({
+      domain: 'ads.test', action: 'block', connectionIds: ['10.0.0.1:80'],
+    })));
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle non-JSON error responses gracefully
-  });
-
-  it('should handle AdGuard API error with different status codes', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: false,
-        },
-      ],
-      masterServerIp: null,
-    };
-
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    
-    // Mock httpRequest to return a 404 error (not 500)
-    const mockResponse = {
-      statusCode: 404,
-      headers: {},
-      body: JSON.stringify({ message: 'Not found' }),
-    };
-    mockHttpRequest.mockResolvedValue(mockResponse);
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle different error status codes
-  });
-
-  it('should handle connections with allowInsecure enabled', async () => {
-    const mockConnections = {
-      connections: [
-        {
-          ip: '192.168.1.1',
-          port: 80,
-          username: 'admin',
-          password: 'encrypted-password',
-          allowInsecure: true, // Test with allowInsecure: true
-        },
-      ],
-      masterServerIp: null,
-    };
-
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockConnections));
-    mockCryptoJS.AES.decrypt.mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted-password'),
-    });
-    mockHttpRequest.mockResolvedValue({
-      statusCode: 200,
-      headers: {},
-      body: JSON.stringify({ success: true }),
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allowInsecure: true,
-      })
-    );
-  });
-
-  it('should handle malformed connections file', async () => {
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue('invalid json content');
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        domain: 'example.com',
-        action: 'block',
-      }),
-    } as unknown as Request;
-
-    const response = await POST(mockRequest);
-
-    expect(response.status).toBe(200);
-    // Should handle JSON parse errors gracefully
+    expect(log.some(line => line.includes('Failed to fetch filtering status: 403'))).toBe(true);
   });
 });

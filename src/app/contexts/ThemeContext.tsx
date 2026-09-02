@@ -1,6 +1,9 @@
+"use client";
+
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 
-type Theme = 'green' | 'purple' | 'orange';
+export const THEMES = ['green', 'blue', 'purple', 'orange'] as const;
+export type Theme = (typeof THEMES)[number];
 
 interface ThemeContextType {
   theme: Theme;
@@ -17,36 +20,40 @@ export const useTheme = () => {
   return context;
 };
 
-interface ThemeProviderProps {
-  children: ReactNode;
-}
+const STORAGE_KEY = 'adguard-buddy-theme';
 
-export const ThemeProvider = ({ children }: ThemeProviderProps) => {
-  const [theme, setTheme] = useState<Theme>('green'); // Default theme
+/**
+ * The theme only swaps the accent hue; the surface and text scales are fixed.
+ * AdGuard Buddy is a dark-only monitoring surface by design.
+ */
+export const ThemeProvider = ({ children }: { children: ReactNode }) => {
+  const [theme, setTheme] = useState<Theme>('green');
 
-  // Effect to load theme from localStorage on mount
   useEffect(() => {
-    const savedTheme = localStorage.getItem('adguard-buddy-theme') as Theme | null;
-    if (savedTheme && ['green', 'purple', 'orange'].includes(savedTheme)) {
-      setTheme(savedTheme);
+    let savedTheme: string | null = null;
+    try {
+      savedTheme = localStorage.getItem(STORAGE_KEY);
+    } catch {
+      savedTheme = null;
+    }
+    if (savedTheme && (THEMES as readonly string[]).includes(savedTheme)) {
+      setTheme(savedTheme as Theme);
     }
   }, []);
 
-  // Effect to apply theme class to body and save to localStorage
   useEffect(() => {
     const body = document.body;
-    // Remove old theme classes
-    body.classList.remove('theme-green', 'theme-purple', 'theme-orange');
-    // Add new theme class
+    THEMES.forEach(t => body.classList.remove(`theme-${t}`));
     body.classList.add(`theme-${theme}`);
-    // Save to localStorage
-    localStorage.setItem('adguard-buddy-theme', theme);
+    try {
+      localStorage.setItem(STORAGE_KEY, theme);
+    } catch {
+      /* ignore unavailable storage */
+    }
   }, [theme]);
 
-  const value = { theme, setTheme };
-
   return (
-    <ThemeContext.Provider value={value}>
+    <ThemeContext.Provider value={{ theme, setTheme }}>
       {children}
     </ThemeContext.Provider>
   );

@@ -1,525 +1,200 @@
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { screen, waitFor, fireEvent } from '@testing-library/react';
 import Settings from '../page';
+import { useConnections } from '../../contexts/ConnectionsContext';
+import { ThemeProvider } from '../../contexts/ThemeContext';
+import { connection, mockConnectionsValue, renderWithProviders } from '../../../test-utils';
 
-// Mock dependencies
-jest.mock('../../components/NavMenu', () => ({
-  __esModule: true,
-  default: () => <nav data-testid="nav-menu">Navigation</nav>,
+jest.mock('../../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
 }));
 
-jest.mock('../../contexts/ThemeContext', () => ({
-  useTheme: () => ({
-    theme: 'dark',
-    setTheme: jest.fn(),
-  }),
-}));
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
-// Mock crypto-js
-jest.mock('crypto-js', () => ({
-  AES: {
-    encrypt: jest.fn(() => 'encrypted-password'),
-    decrypt: jest.fn(() => ({
-      toString: jest.fn(() => 'decrypted-password'),
-    })),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
-}));
+const AUTO_SYNC = {
+  config: { enabled: false, interval: 'disabled', categories: [] },
+  nextSync: null,
+  isPaused: false,
+  recentLogs: [],
+};
 
-// Mock fetch
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
+function mockFetch() {
+  return jest.fn(async (url: string) => {
+    if (String(url).includes('auto-sync-config')) {
+      return { ok: true, status: 200, json: async () => AUTO_SYNC } as unknown as Response;
+    }
+    if (String(url).includes('check-adguard')) {
+      return { ok: true, status: 200, json: async () => ({ status: 'connected' }) } as unknown as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({ message: 'ok' }) } as unknown as Response;
+  });
+}
 
-// Helper function to mock auto-sync config response
-const mockAutoSyncConfigResponse = () => ({
-  ok: true,
-  json: () => Promise.resolve({
-    config: {
-      enabled: false,
-      interval: '0 */6 * * *',
-      categories: [],
-      paused: false
-    },
-    isPaused: false,
-    isRunning: false,
-    nextSync: null,
-    recentLogs: []
-  }),
-});
-
-// Mock window.scrollTo
-Object.defineProperty(window, 'scrollTo', {
-  writable: true,
-  value: jest.fn(),
-});
+const render = (ui: React.ReactElement) => renderWithProviders(<ThemeProvider>{ui}</ThemeProvider>);
 
 describe('Settings', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch.mockClear();
-
-    // Default: Mock both /api/get-connections and /api/auto-sync-config
-    // Tests can override this by calling mockFetch.mockImplementation or adding more mockResolvedValueOnce calls
-    mockFetch.mockImplementation((url) => {
-      if (url === '/api/get-connections') {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-        });
-      }
-      if (url === '/api/auto-sync-config') {
-        return Promise.resolve(mockAutoSyncConfigResponse());
-      }
-      // Return a rejected promise for unmocked URLs to make tests fail explicitly
-      return Promise.reject(new Error(`Unmocked fetch to: ${url}`));
-    });
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [], selectedId: null, selected: null }));
+    global.fetch = mockFetch() as unknown as typeof fetch;
   });
 
-  it('renders the settings page with navigation', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
+  it('sends a new connection with a plaintext password for the server to encrypt', async () => {
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    expect(screen.getByText('Settings')).toBeInTheDocument();
-  });
-
-  it('fetches settings on mount', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        connections: mockConnections,
-        masterServerIp: '192.168.1.100'
-      }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.change(screen.getByLabelText('IP or URL'), { target: { value: '10.0.0.5' } });
+    fireEvent.change(screen.getByLabelText('Port'), { target: { value: '3000' } });
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add connection' }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-  });
-
-  it('displays connection form fields', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Check for inputs by placeholder text since they don't have labels
-    expect(screen.getByPlaceholderText(/IP or URL/)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Port')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Username')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Password')).toBeInTheDocument();
-  });
-
-  it('handles fetch settings error gracefully', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should still render the page even with fetch error
-    expect(screen.getByText('Settings')).toBeInTheDocument();
-  });
-
-  it('renders add connection form', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    expect(screen.getByText('New Connection')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument();
-  });
-
-  it('handles form input changes', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const targetInput = screen.getByPlaceholderText(/IP or URL/);
-    fireEvent.change(targetInput, { target: { value: '192.168.1.1' } });
-
-    // The form state is managed internally, so we just verify the input exists
-    expect(targetInput).toHaveValue('192.168.1.1');
-  });
-
-  it('toggles password visibility', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const passwordInput = screen.getByPlaceholderText('Password');
-    const toggleButton = screen.getByLabelText('Show password');
-
-    expect(passwordInput).toHaveAttribute('type', 'password');
-
-    fireEvent.click(toggleButton);
-    expect(passwordInput).toHaveAttribute('type', 'text');
-
-    fireEvent.click(toggleButton);
-    expect(passwordInput).toHaveAttribute('type', 'password');
-  });
-
-  it('handles insecure SSL checkbox', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const checkbox = screen.getByLabelText('Allow insecure SSL (accept self-signed certificates)');
-    expect(checkbox).not.toBeChecked();
-
-    fireEvent.click(checkbox);
-    expect(checkbox).toBeChecked();
-  });
-
-  it('saves new connection successfully', async () => {
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ enabled: false, interval: '0 */6 * * *', isPaused: false }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ status: 'connected' }),
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('save-connections'));
+      expect(JSON.parse(call[1].body).connections[0]).toEqual({
+        ip: '10.0.0.5',
+        url: undefined,
+        port: 3000,
+        username: 'admin',
+        allowInsecure: false,
+        password: 'hunter2',
       });
-
-    await act(async () => {
-      render(<Settings />);
     });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const targetInput = screen.getByPlaceholderText(/IP or URL/);
-    const usernameInput = screen.getByPlaceholderText('Username');
-    const passwordInput = screen.getByPlaceholderText('Password');
-    const saveButton = screen.getByRole('button', { name: /save/i });
-
-    fireEvent.change(targetInput, { target: { value: '192.168.1.1' } });
-    fireEvent.change(usernameInput, { target: { value: 'admin' } });
-    fireEvent.change(passwordInput, { target: { value: 'password123' } });
-
-    await act(async () => {
-      fireEvent.click(saveButton);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/save-connections', expect.any(Object));
-    });
-
-    expect(screen.getByText('Connection to 192.168.1.1:80 successful!')).toBeInTheDocument();
   });
 
-  it('shows error when saving without required fields', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
+  it('requires a password for a new connection', async () => {
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.change(screen.getByLabelText('IP or URL'), { target: { value: '10.0.0.5' } });
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'admin' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add connection' }));
 
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const saveButton = screen.getByRole('button', { name: /save/i });
-
-    await act(async () => {
-      fireEvent.click(saveButton);
-    });
-
-    // Should not call save API when required fields are missing
-    expect(mockFetch).toHaveBeenCalledTimes(2); // get-connections + auto-sync-config
+    await waitFor(() =>
+      expect(screen.getByText('A password is required for new connections.')).toBeInTheDocument());
+    expect((global.fetch as jest.Mock).mock.calls.some(([url]) =>
+      String(url).includes('save-connections'))).toBe(false);
   });
 
-  it('switches theme', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
+  it('derives the port from a URL target', async () => {
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.change(screen.getByLabelText('IP or URL'), { target: { value: 'https://adguard.local' } });
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add connection' }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('save-connections'));
+      const saved = JSON.parse(call[1].body).connections[0];
+      expect(saved).toMatchObject({ url: 'https://adguard.local', port: 443 });
+      expect(saved.ip).toBeUndefined();
     });
-
-    const greenThemeButton = screen.getByRole('button', { name: /green/i });
-    fireEvent.click(greenThemeButton);
-
-    // Theme switching is handled by context, so we just verify the button exists
-    expect(greenThemeButton).toBeInTheDocument();
   });
 
-  it('handles URL parsing in form input', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
+  it('omits the password when editing without entering a new one', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [connection()] }));
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.click(screen.getByLabelText('Edit 192.168.1.1:80'));
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'newadmin' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Update connection' }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('save-connections'));
+      const saved = JSON.parse(call[1].body).connections[0];
+      expect(saved.username).toBe('newadmin');
+      expect(saved).not.toHaveProperty('password');
     });
-
-    const targetInput = screen.getByPlaceholderText(/IP or URL/);
-    const portInput = screen.getByPlaceholderText('Port');
-
-    // Test HTTPS URL
-    fireEvent.change(targetInput, { target: { value: 'https://adguard.example.com' } });
-    expect(portInput).toHaveValue(443);
-
-    // Test HTTP URL
-    fireEvent.change(targetInput, { target: { value: 'http://adguard.example.com' } });
-    expect(portInput).toHaveValue(80);
-
-    // Test URL with custom port
-    fireEvent.change(targetInput, { target: { value: 'https://adguard.example.com:8443' } });
-    expect(portInput).toHaveValue(8443);
   });
 
-  it('handles edit connection functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('lists saved connections and marks the master', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+      masterServerId: '192.168.1.1:80',
+    }));
+    render(<Settings />);
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections, masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render edit button
-    expect(screen.getByText('Settings')).toBeInTheDocument();
+    expect(screen.getByText('Master')).toBeInTheDocument();
+    expect(screen.getByLabelText('Current master server')).toBeDisabled();
+    expect(screen.getByLabelText('Set 10.0.0.2:80 as master')).toBeEnabled();
   });
 
-  it('handles delete connection functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('tests a connection by id', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [connection()] }));
+    render(<Settings />);
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections, masterServerIp: null }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      });
-
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.click(screen.getByLabelText('Test connection to 192.168.1.1:80'));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('check-adguard'));
+      expect(JSON.parse(call[1].body)).toEqual({ connectionId: '192.168.1.1:80' });
     });
-
-    // Should render delete button
-    expect(screen.getByText('Settings')).toBeInTheDocument();
   });
 
-  it('handles master server functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('asks for confirmation before deleting', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [connection()] }));
+    render(<Settings />);
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections, masterServerIp: null }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      });
+    fireEvent.click(screen.getByLabelText('Delete 192.168.1.1:80'));
 
-    await act(async () => {
-      render(<Settings />);
-    });
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect((global.fetch as jest.Mock).mock.calls.some(([url]) =>
+      String(url).includes('save-connections'))).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('save-connections'));
+      expect(JSON.parse(call[1].body).connections).toEqual([]);
     });
-
-    // Should handle master server setting
-    expect(screen.getByText('Settings')).toBeInTheDocument();
   });
 
-  it('handles connection test functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('clears the master when the master itself is deleted', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection()], masterServerId: '192.168.1.1:80',
+    }));
+    render(<Settings />);
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections, masterServerIp: null }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ status: 'connected' }),
-      });
-
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.click(screen.getByLabelText('Delete 192.168.1.1:80'));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('save-connections'));
+      expect(JSON.parse(call[1].body).masterServerIp).toBeNull();
     });
-
-    // Should render test button
-    expect(screen.getByText('Settings')).toBeInTheDocument();
   });
 
-  it('handles form validation for empty fields', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
+  it('warns that auto-sync needs a master server', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [connection()], masterServerId: null }));
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    const saveButton = screen.getByRole('button', { name: /save/i });
-
-    // Try to save without filling required fields
-    await act(async () => {
-      fireEvent.click(saveButton);
-    });
-
-    // Should not call save API
-    expect(mockFetch).toHaveBeenCalledTimes(2); // get-connections + auto-sync-config
+    expect(screen.getByText('No master server selected')).toBeInTheDocument();
   });
 
-  it('handles URL-based connections', async () => {
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ status: 'connected' }),
-      });
+  it('enables auto-sync through the API', async () => {
+    render(<Settings />);
 
-    await act(async () => {
-      render(<Settings />);
-    });
+    fireEvent.click(screen.getByRole('checkbox', { name: /Enable automatic sync/ }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls
+        .find(([url, init]) => String(url).includes('auto-sync-config') && init?.method === 'POST');
+      expect(JSON.parse(call[1].body)).toEqual({ enabled: true });
     });
+  });
 
-    const targetInput = screen.getByPlaceholderText(/IP or URL/);
-    const usernameInput = screen.getByPlaceholderText('Username');
-    const passwordInput = screen.getByPlaceholderText('Password');
-    const saveButton = screen.getByRole('button', { name: /save/i });
+  it('offers every accent theme', () => {
+    render(<Settings />);
 
-    fireEvent.change(targetInput, { target: { value: 'https://adguard.example.com' } });
-    fireEvent.change(usernameInput, { target: { value: 'admin' } });
-    fireEvent.change(passwordInput, { target: { value: 'password123' } });
-
-    await act(async () => {
-      fireEvent.click(saveButton);
+    ['green', 'blue', 'purple', 'orange'].forEach(name => {
+      expect(screen.getByRole('button', { name: new RegExp(name, 'i') })).toBeInTheDocument();
     });
+  });
 
-    // Should handle URL connections
-    expect(screen.getByText('Settings')).toBeInTheDocument();
+  it('applies a chosen theme to the body', () => {
+    render(<Settings />);
+
+    fireEvent.click(screen.getByRole('button', { name: /purple/i }));
+
+    expect(document.body.classList.contains('theme-purple')).toBe(true);
   });
 });

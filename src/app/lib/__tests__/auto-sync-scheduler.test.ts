@@ -1,17 +1,28 @@
 // Mock all dependencies BEFORE any imports
 jest.mock('fs');
 jest.mock('node-cron');
-jest.mock('crypto-js');
 jest.mock('../../api/logger');
 jest.mock('../../api/sync-category/sync-logic');
+// Credentials are read through the shared server-side store, never re-implemented here.
+jest.mock('@/lib/serverConnections', () => ({
+  readMigratedStore: jest.fn(),
+  resolveAllConnections: jest.fn(),
+}));
 
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
-import CryptoJS from 'crypto-js';
+import { readMigratedStore, resolveAllConnections } from '@/lib/serverConnections';
 import logger from '../../api/logger';
 import { performCategorySync } from '../../api/sync-category/sync-logic';
 import { getAutoSyncScheduler } from '../auto-sync-scheduler';
+
+const mockReadStore = readMigratedStore as jest.MockedFunction<typeof readMigratedStore>;
+const mockResolveAll = resolveAllConnections as jest.MockedFunction<typeof resolveAllConnections>;
+
+/** The store hands back connections with plaintext passwords. */
+const decrypted = (connections: Array<Record<string, unknown>>) =>
+  connections.map((conn, index) => ({ ...conn, password: `decrypted-${index + 1}` }));
 
 describe('AutoSyncScheduler', () => {
   let mockTask: any;
@@ -60,10 +71,9 @@ describe('AutoSyncScheduler', () => {
     };
     (cron.schedule as jest.Mock).mockReturnValue(mockTask);
 
-    // Mock CryptoJS
-    (CryptoJS.AES.decrypt as jest.Mock).mockReturnValue({
-      toString: jest.fn().mockReturnValue('decrypted_password'),
-    });
+    // Default: an empty store. Individual suites override it.
+    mockReadStore.mockResolvedValue({ connections: [], masterServerIp: null });
+    mockResolveAll.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -298,10 +308,8 @@ describe('AutoSyncScheduler', () => {
         if (path.includes('connections.json')) return true;
         return false;
       });
-      (fs.readFileSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return JSON.stringify(mockConnections);
-        return '{}';
-      });
+      mockReadStore.mockResolvedValue(mockConnections as never);
+      mockResolveAll.mockResolvedValue(decrypted(mockConnections.connections) as never);
       (performCategorySync as jest.Mock).mockResolvedValue(undefined);
     });
 
@@ -328,7 +336,8 @@ describe('AutoSyncScheduler', () => {
     });
 
     it('should skip if no connections configured', async () => {
-      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      mockReadStore.mockResolvedValue({ connections: [], masterServerIp: null });
+      mockResolveAll.mockResolvedValue([]);
 
       const scheduler = getAutoSyncScheduler();
       scheduler.updateConfig({ enabled: true, interval: '15min' });
@@ -338,10 +347,10 @@ describe('AutoSyncScheduler', () => {
     });
 
     it('should skip if no master server configured', async () => {
-      (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({
+      mockReadStore.mockResolvedValue({
         connections: mockConnections.connections,
         masterServerIp: null,
-      }));
+      } as never);
 
       const scheduler = getAutoSyncScheduler();
       scheduler.updateConfig({ enabled: true, interval: '15min' });
@@ -370,12 +379,34 @@ describe('AutoSyncScheduler', () => {
       expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('already in progress'));
     });
 
-    it('should decrypt passwords before syncing', async () => {
+    it('resolves credentials through the shared store rather than decrypting itself', async () => {
       const scheduler = getAutoSyncScheduler();
       scheduler.updateConfig({ enabled: true, interval: '15min' });
       await scheduler.triggerManualSync();
 
-      expect(CryptoJS.AES.decrypt).toHaveBeenCalled();
+      expect(mockResolveAll).toHaveBeenCalled();
+      // The master connection reaches the sync with a plaintext password.
+      expect(performCategorySync).toHaveBeenCalledWith(
+        expect.objectContaining({ password: 'decrypted-1' }),
+        expect.objectContaining({ password: 'decrypted-2' }),
+        expect.any(String),
+        expect.any(Function),
+      );
+    });
+
+    it('logs a connection whose password could not be decrypted', async () => {
+      mockResolveAll.mockResolvedValue([
+        { ...mockConnections.connections[0], password: 'decrypted-1' },
+        { ...mockConnections.connections[1], password: '' },
+      ] as never);
+
+      const scheduler = getAutoSyncScheduler();
+      scheduler.updateConfig({ enabled: true, interval: '15min' });
+      await scheduler.triggerManualSync();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to decrypt password for connection: 192.168.1.2:3000'),
+      );
     });
   });
 
@@ -483,14 +514,8 @@ describe('AutoSyncScheduler', () => {
     });
 
     it('should handle sync errors gracefully', async () => {
-      (fs.existsSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return true;
-        return false;
-      });
-      (fs.readFileSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return JSON.stringify(mockConnections);
-        return '{}';
-      });
+      mockReadStore.mockResolvedValue(mockConnections as never);
+      mockResolveAll.mockResolvedValue(decrypted(mockConnections.connections) as never);
       (performCategorySync as jest.Mock).mockRejectedValue(new Error('Sync failed'));
 
       const scheduler = getAutoSyncScheduler();
@@ -500,38 +525,28 @@ describe('AutoSyncScheduler', () => {
       expect(logger.error).toHaveBeenCalled();
     });
 
-    it('should handle password decryption errors', async () => {
-      // Reset CryptoJS mock to throw error
-      (CryptoJS.AES.decrypt as jest.Mock).mockImplementation(() => {
-        throw new Error('Decryption failed');
-      });
-      
-      (fs.existsSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return true;
-        return false;
-      });
-      (fs.readFileSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return JSON.stringify(mockConnections);
-        return '{}';
-      });
+    it('fails the cycle when the master password cannot be decrypted', async () => {
+      mockReadStore.mockResolvedValue(mockConnections as never);
+      // An empty password means the store could not decrypt it.
+      mockResolveAll.mockResolvedValue(
+        mockConnections.connections.map(conn => ({ ...conn, password: '' })) as never,
+      );
 
       const scheduler = getAutoSyncScheduler();
       scheduler.updateConfig({ enabled: true, interval: '15min' });
-      
-      // The decryption error is caught and handled, sync continues
       await scheduler.triggerManualSync();
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Password decryption resulted in empty string'));
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to decrypt password for connection'),
+      );
+      // A cycle with unusable credentials must not attempt to push anything.
+      expect(performCategorySync).not.toHaveBeenCalled();
     });
 
     it('should handle missing logs directory', async () => {
-      (fs.existsSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return true;
-        return false; // logs directory doesn't exist
-      });
-      (fs.readFileSync as jest.Mock).mockImplementation((path: string) => {
-        if (path.includes('connections.json')) return JSON.stringify(mockConnections);
-        return '{}';
-      });
+      mockReadStore.mockResolvedValue(mockConnections as never);
+      mockResolveAll.mockResolvedValue(decrypted(mockConnections.connections) as never);
+      (fs.existsSync as jest.Mock).mockReturnValue(false); // logs directory doesn't exist
       (fs.mkdirSync as jest.Mock).mockImplementation(() => {});
       (performCategorySync as jest.Mock).mockResolvedValue(undefined);
 

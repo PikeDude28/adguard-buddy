@@ -1,44 +1,59 @@
 import { render, screen } from '@testing-library/react';
 import Home from '../page';
+import { useConnections } from '../contexts/ConnectionsContext';
+import { mockConnectionsValue, connection } from '../../test-utils';
 
-// Mock dependencies (though Home has none now except next/link which works in Jest usually, or might need simple mock if strictly unit)
-// Next/link usually renders as a <a> tag in tests if not mocked, which is fine.
+jest.mock('../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
+}));
+
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
 describe('Home', () => {
-  it('renders the main heading', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('links to every section', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue());
     render(<Home />);
-    const heading = screen.getByRole('heading', { level: 1 });
-    // Text might be split into spans, so we check for content
-    expect(heading).toHaveTextContent(/Welcome to/i);
-    expect(heading).toHaveTextContent(/AdGuard Buddy/i);
+
+    const hrefs = screen.getAllByRole('link').map(link => link.getAttribute('href'));
+    expect(hrefs).toEqual(expect.arrayContaining([
+      '/dashboard', '/query-log', '/statistics', '/sync-status', '/settings',
+    ]));
   });
 
-  it('renders the description paragraph', () => {
+  it('describes what each section is for', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue());
     render(<Home />);
-    expect(screen.getByText(/A powerful tool to manage and synchronize your AdGuard Home instances/i)).toBeInTheDocument();
+
+    expect(screen.getByText('Search DNS queries across all servers')).toBeInTheDocument();
+    expect(screen.getByText('What drifted from the master, and one-click sync')).toBeInTheDocument();
   });
 
-  it('renders quick navigation links', () => {
+  it('shows the getting-started steps when nothing is configured', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ connections: [], selectedId: null, selected: null }));
     render(<Home />);
 
-    // Check for specific links (Dashboard appears twice: in card and getting started)
-    const dashboardLinks = screen.getAllByRole('link', { name: /Dashboard/i });
-    expect(dashboardLinks.length).toBeGreaterThanOrEqual(1);
-    expect(dashboardLinks[0]).toHaveAttribute('href', '/dashboard');
-
-    expect(screen.getByRole('link', { name: /Query Log/i })).toHaveAttribute('href', '/query-log');
-    expect(screen.getByRole('link', { name: /Statistics/i })).toHaveAttribute('href', '/statistics');
-    expect(screen.getByRole('link', { name: /Sync Status/i })).toHaveAttribute('href', '/sync-status');
-
-    // Check for Settings links (appears twice: in card and getting started)
-    const settingsLinks = screen.getAllByRole('link', { name: /Settings/i });
-    expect(settingsLinks.length).toBeGreaterThanOrEqual(1);
-    expect(settingsLinks[0]).toHaveAttribute('href', '/settings');
+    expect(screen.getByText('Getting started')).toBeInTheDocument();
+    expect(screen.getByText('Add your servers')).toBeInTheDocument();
+    expect(screen.getByText('Pick a master')).toBeInTheDocument();
   });
 
-  it('renders Getting Started guide', () => {
+  it('hides the getting-started steps once servers exist', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection(), connection({ id: 'b', ip: '10.0.0.2' })],
+    }));
     render(<Home />);
-    expect(screen.getByRole('heading', { level: 2, name: /Getting Started/i })).toBeInTheDocument();
-    expect(screen.getByText(/Set a master server for synchronization/i)).toBeInTheDocument();
+
+    expect(screen.queryByText('Getting started')).not.toBeInTheDocument();
+    expect(screen.getByText(/2 servers configured/)).toBeInTheDocument();
+  });
+
+  it('does not claim a server count while loading', () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({ isLoading: true }));
+    render(<Home />);
+
+    expect(screen.queryByText(/servers configured/)).not.toBeInTheDocument();
   });
 });

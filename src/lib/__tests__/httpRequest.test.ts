@@ -1,4 +1,4 @@
-import { httpRequest } from '../httpRequest';
+import { httpRequest, DEFAULT_TIMEOUT_MS } from '../httpRequest';
 import http from 'http';
 import https from 'https';
 
@@ -45,6 +45,8 @@ describe('httpRequest', () => {
       write: jest.fn(),
       end: jest.fn(),
       on: requestOnMock,
+      setTimeout: jest.fn(),
+      destroy: jest.fn(),
     } as unknown as jest.Mocked<http.ClientRequest>;
 
     // Mock the request method for both http and https
@@ -327,5 +329,92 @@ describe('httpRequest', () => {
       path: '/api/test',
       headers: {},
     }, expect.any(Function));
+  });
+});
+
+describe('httpRequest timeouts', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('arms a socket timeout with the default duration', async () => {
+    const setTimeoutMock = jest.fn();
+    const request = {
+      write: jest.fn(),
+      end: jest.fn(),
+      on: jest.fn(),
+      setTimeout: setTimeoutMock,
+      destroy: jest.fn(),
+    };
+    const response = {
+      statusCode: 200,
+      headers: {},
+      setEncoding: jest.fn(),
+      on: jest.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'end') setTimeout(() => cb(), 0);
+        return response;
+      }),
+    };
+
+    (http.request as unknown as jest.Mock).mockImplementation((_options, callback) => {
+      if (callback) callback(response);
+      return request;
+    });
+
+    await httpRequest({ method: 'GET', url: 'http://example.com/x' });
+
+    expect(setTimeoutMock).toHaveBeenCalledWith(DEFAULT_TIMEOUT_MS, expect.any(Function));
+  });
+
+  it('destroys the request when the timeout fires', async () => {
+    const destroy = jest.fn();
+    let fireTimeout: (() => void) | undefined;
+    const request = {
+      write: jest.fn(),
+      end: jest.fn(),
+      on: jest.fn().mockImplementation((event: string, cb: (error: Error) => void) => {
+        if (event === 'error') {
+          // Surface the destroy() error the way node does.
+          setTimeout(() => {
+            fireTimeout?.();
+            cb(new Error('Request to example.com timed out after 50ms'));
+          }, 0);
+        }
+        return request;
+      }),
+      setTimeout: jest.fn().mockImplementation((_ms: number, cb: () => void) => { fireTimeout = cb; }),
+      destroy,
+    };
+
+    (http.request as unknown as jest.Mock).mockImplementation(() => request);
+
+    await expect(
+      httpRequest({ method: 'GET', url: 'http://example.com/x', timeoutMs: 50 }),
+    ).rejects.toThrow(/timed out after 50ms/);
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it('skips the timeout when it is disabled', async () => {
+    const setTimeoutMock = jest.fn();
+    const request = {
+      write: jest.fn(), end: jest.fn(), on: jest.fn(), setTimeout: setTimeoutMock, destroy: jest.fn(),
+    };
+    const response = {
+      statusCode: 204,
+      headers: {},
+      setEncoding: jest.fn(),
+      on: jest.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'end') setTimeout(() => cb(), 0);
+        return response;
+      }),
+    };
+    (http.request as unknown as jest.Mock).mockImplementation((_options, callback) => {
+      if (callback) callback(response);
+      return request;
+    });
+
+    await httpRequest({ method: 'GET', url: 'http://example.com/x', timeoutMs: 0 });
+
+    expect(setTimeoutMock).not.toHaveBeenCalled();
   });
 });

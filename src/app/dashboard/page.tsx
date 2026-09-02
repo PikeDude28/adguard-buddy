@@ -1,399 +1,444 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
-import CryptoJS from "crypto-js";
-import { components } from "../../types/adguard";
-import { RefreshCw, Power, PowerOff, Router, User, Info, BarChart3 } from "lucide-react";
 
-type Connection = {
-  ip: string;
-  username: string;
-  password: string;
-  url?: string;
-  port?: number;
-  allowInsecure?: boolean;
-};
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  RefreshCw, Power, PowerOff, ServerCog, ShieldCheck, Activity, Timer, Server,
+  ChevronDown, ChevronRight, AlertCircle,
+} from "lucide-react";
+import { components } from "../../types/adguard";
+import { connectionLabel, useConnections, type PublicConnection } from "../contexts/ConnectionsContext";
+import {
+  Alert, Badge, Button, Card, CardHeader, EmptyState, IconButton,
+  PageHeader, StatTile, StatTileSkeleton, TableSkeleton, useToast,
+} from "../components/ui";
+import { Sparkline } from "../components/charts";
 
 type AdGuardServerStatus = components['schemas']['ServerStatus'];
 type AdGuardStats = components['schemas']['Stats'];
 
-type Result = Connection & {
-  status: string;
-  response: string;
+type ServerResult = {
+  connection: PublicConnection;
+  status: 'connected' | 'error';
+  /** Parsed /control/status payload, or null when the server did not answer. */
+  info: AdGuardServerStatus | null;
+  stats: AdGuardStats | null;
   code?: number;
-  stats?: AdGuardStats | null;
+  message?: string;
 };
 
-type CheckAdguardResponse = {
-  status: string;
-  response: string;
-  code?: number;
-  stats: AdGuardStats | null;
-}
+const numberFormat = new Intl.NumberFormat();
 
 export default function Dashboard() {
-  const [connections, setConnections] = useState<Connection[]>([]);
-  const [results, setResults] = useState<Result[]>([]);
+  const { connections, isLoading: connectionsLoading } = useConnections();
+  const { notify } = useToast();
+
+  const [results, setResults] = useState<ServerResult[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [updatingIp, setUpdatingIp] = useState<string | null>(null);
-  const encryptionKey = process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY || "adguard-buddy-key";
-
-  const toggleProtection = async (connection: Connection, enabled: boolean) => {
-    const id = connection.url && connection.url.length > 0 ? connection.url.replace(/\/$/, '') : `${connection.ip}${connection.port ? ':' + connection.port : ''}`;
-    setUpdatingIp(id);
-    setError(null);
-    try {
-      let decrypted = "";
-      try {
-        decrypted = CryptoJS.AES.decrypt(connection.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-      } catch {
-        decrypted = "";
-      }
-
-      const response = await fetch('/api/adguard-control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...connection,
-          password: decrypted,
-          protection_enabled: enabled,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        setError(`Error toggling protection for ${connection.url || connection.ip}: ${errorData.message || 'Unknown error'}`);
-        return;
-      }
-
-      await fetchAll();
-
-    } catch (err) {
-      setError(`A network error occurred while toggling protection.`);
-      console.error(err);
-    } finally {
-      setUpdatingIp(null);
-    }
-  };
-
-  const toggleAllProtection = async (enabled: boolean) => {
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const togglePromises = connections.map(conn => {
-        let decrypted = "";
-        try {
-          decrypted = CryptoJS.AES.decrypt(conn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-        } catch {
-          decrypted = "";
-        }
-
-        return fetch('/api/adguard-control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...conn,
-            password: decrypted,
-            protection_enabled: enabled,
-          }),
-        });
-      });
-
-      const responses = await Promise.all(togglePromises);
-
-      const failedResponses = responses.filter(res => !res.ok);
-      if (failedResponses.length > 0) {
-        setError(`Failed to toggle protection for ${failedResponses.length} servers.`);
-      }
-
-    } catch (err) {
-      setError(`A network error occurred during a global toggle action.`);
-      console.error(err);
-    } finally {
-      await fetchAll();
-    }
-  };
-
-  useEffect(() => {
-    const fetchConnections = async () => {
-      try {
-        const response = await fetch('/api/get-connections');
-        if (!response.ok) {
-          throw new Error('Failed to fetch connections.');
-        }
-        const data = await response.json();
-        const conns = data.connections || [];
-        setConnections(conns);
-        if (conns.length === 0) {
-          setIsLoading(false);
-        }
-      } catch (error) {
-        const err = error as Error;
-        setError(`Error fetching connections: ${err.message}`);
-        setIsLoading(false);
-      }
-    };
-    fetchConnections();
-  }, []);
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [bulkAction, setBulkAction] = useState<'enable' | 'disable' | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const fetchAll = useCallback(async () => {
     if (connections.length === 0) {
+      setResults([]);
+      setIsLoading(false);
       return;
     }
+
     setIsLoading(true);
     setError(null);
     try {
-      const res = await Promise.all(
-        connections.map(async (conn): Promise<Result> => {
-          let decrypted = "";
-          try {
-            decrypted = CryptoJS.AES.decrypt(conn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-          } catch {
-            decrypted = "";
-          }
-          const r = await fetch("/api/check-adguard", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ...conn, password: decrypted }),
+      const next = await Promise.all(connections.map(async (connection): Promise<ServerResult> => {
+        try {
+          const response = await fetch('/api/check-adguard', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ connectionId: connection.id }),
           });
-          if (!r.ok) {
-            const errorText = await r.text();
-            return { ...conn, status: "error", response: `Server Error: ${r.status} ${errorText}`, code: r.status, stats: null };
+
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            return {
+              connection,
+              status: 'error',
+              info: null,
+              stats: null,
+              code: response.status,
+              message: body.message || `Server error ${response.status}`,
+            };
           }
 
-          const data = await r.json() as CheckAdguardResponse;
-          return { ...conn, ...data };
-        })
-      );
-      setResults(res);
-    } catch (err: unknown) {
-      setError("A network error occurred while fetching statuses.");
+          const data = await response.json();
+          let info: AdGuardServerStatus | null = null;
+          try {
+            info = JSON.parse(data.response);
+          } catch {
+            info = null;
+          }
+
+          return {
+            connection,
+            status: data.status === 'connected' ? 'connected' : 'error',
+            info,
+            stats: data.stats ?? null,
+            code: data.code,
+            message: info ? undefined : data.response,
+          };
+        } catch (err) {
+          return {
+            connection,
+            status: 'error',
+            info: null,
+            stats: null,
+            message: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }));
+      setResults(next);
+    } catch (err) {
+      setError('A network error occurred while fetching statuses.');
       console.error(err);
     } finally {
       setIsLoading(false);
     }
-  }, [connections, encryptionKey]);
+  }, [connections]);
 
   useEffect(() => {
-    fetchAll();
-  }, [fetchAll]);
+    if (!connectionsLoading) fetchAll();
+  }, [connectionsLoading, fetchAll]);
 
-  function AdGuardStatusCard({ data }: { data: AdGuardServerStatus }) {
-    return (
-      <div className="bg-[#0F1115]/50 rounded-lg p-4 border border-white/5">
-        <h3 className="text-[var(--primary)] font-semibold text-sm uppercase tracking-wider mb-4 flex items-center gap-2">
-          <Info className="w-4 h-4" /> AdGuard Status
-        </h3>
-        <div className="grid grid-cols-2 gap-y-3 gap-x-4 text-sm">
-          <div className="text-gray-500">Version:</div>
-          <div className="text-right font-mono text-gray-300">{data.version || "-"}</div>
-          <div className="text-gray-500">Language:</div>
-          <div className="text-right font-mono text-gray-300">{data.language || "-"}</div>
-          <div className="text-gray-500">Ports (DNS/HTTP):</div>
-          <div className="text-right font-mono text-gray-300">{data.dns_port || "-"} / {data.http_port || "-"}</div>
-          <div className="text-gray-500">Protection:</div>
-          <div className={`text-right font-medium ${data.protection_enabled ? "text-emerald-400" : "text-red-400"}`}>
-            {data.protection_enabled ? "Active" : "Disabled"}
-          </div>
-          <div className="text-gray-500">DHCP / Running:</div>
-          <div className={`text-right font-medium ${data.running ? "text-emerald-400" : "text-red-400"}`}>
-            {data.dhcp_available ? "Available" : "N/A"} / {data.running ? "Yes" : "No"}
-          </div>
-        </div>
-        {Array.isArray(data.dns_addresses) && data.dns_addresses.length > 0 && (
-          <div className="mt-4">
-            <div className="text-gray-500 text-xs uppercase tracking-wider mb-2">DNS Addresses</div>
-            <div className="flex flex-wrap gap-2">
-              {data.dns_addresses.map((addr, i) => (
-                <span key={i} className="inline-flex items-center px-2 py-1 rounded-md text-xs font-mono bg-white/5 text-gray-300 border border-white/10 select-all">
-                  {addr}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
+  const toggleProtection = async (connectionId: string, enabled: boolean) => {
+    setUpdatingId(connectionId);
+    try {
+      const response = await fetch('/api/adguard-control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionId, protection_enabled: enabled }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        notify(`Failed to update ${connectionId}: ${body.message || 'unknown error'}`, 'error');
+        return;
+      }
+      notify(`Protection ${enabled ? 'enabled' : 'disabled'} on ${connectionId}`, 'success');
+      await fetchAll();
+    } catch {
+      notify('A network error occurred while toggling protection.', 'error');
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const toggleAll = async (enabled: boolean) => {
+    setBulkAction(enabled ? 'enable' : 'disable');
+    try {
+      const responses = await Promise.all(connections.map(connection =>
+        fetch('/api/adguard-control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ connectionId: connection.id, protection_enabled: enabled }),
+        }).catch(() => null)
+      ));
+
+      const failed = responses.filter(response => !response || !response.ok).length;
+      if (failed > 0) {
+        notify(`Failed to update ${failed} of ${connections.length} servers.`, 'error');
+      } else {
+        notify(`Protection ${enabled ? 'enabled' : 'disabled'} on all servers.`, 'success');
+      }
+    } finally {
+      setBulkAction(null);
+      await fetchAll();
+    }
+  };
+
+  // Fleet-level figures, so ten servers still fit on one screen.
+  const totals = useMemo(() => {
+    const online = results.filter(r => r.status === 'connected').length;
+    const queries = results.reduce((sum, r) => sum + (r.stats?.num_dns_queries || 0), 0);
+    const blocked = results.reduce((sum, r) => sum + (r.stats?.num_blocked_filtering || 0), 0);
+    const weightedLatency = results.reduce(
+      (sum, r) => sum + (r.stats?.avg_processing_time || 0) * (r.stats?.num_dns_queries || 0), 0,
     );
-  }
+    const unprotected = results.filter(r => r.info && !r.info.protection_enabled).length;
+    return {
+      online,
+      total: results.length,
+      queries,
+      blocked,
+      blockedShare: queries > 0 ? (blocked / queries) * 100 : 0,
+      avgLatencyMs: queries > 0 ? (weightedLatency / queries) * 1000 : 0,
+      unprotected,
+    };
+  }, [results]);
 
-  function AdGuardStatsCard({ stats }: { stats: AdGuardStats }) {
-    if (!stats) return null;
-
-    const statItems = [
-      { key: 'num_dns_queries', label: 'DNS queries', color: 'var(--primary)' },
-      { key: 'num_blocked_filtering', label: 'Blocked', color: '#34d399' },
-      { key: 'num_replaced_safebrowsing', label: 'Blocked Malware', color: '#fbbf24' },
-      { key: 'num_replaced_parental', label: 'Block parental', color: '#f472b6' },
-    ] as const;
-
-    const maxQueries = stats.num_dns_queries || 1;
-
-    return (
-      <div className="bg-[#0F1115]/50 rounded-lg p-4 border border-white/5">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-[var(--primary)] font-semibold text-sm uppercase tracking-wider flex items-center gap-2">
-            <BarChart3 className="w-4 h-4" /> Statistics
-          </h3>
-          <span className="text-[10px] text-gray-500">Live Updates</span>
-        </div>
-        <div className="space-y-3">
-          {statItems.map(({ key, label, color }) => {
-            const value = stats[key] || 0;
-            const percentage = key === 'num_dns_queries' ? 100 : Math.min(100, (value / maxQueries) * 100 * 5);
-            return (
-              <div key={key}>
-                <div className="flex justify-between items-center text-sm mb-1">
-                  <span className="text-gray-500">{label}</span>
-                  <span className="font-mono font-medium" style={{ color }}>
-                    {value ? value.toLocaleString() : '-'}
-                  </span>
-                </div>
-                {value > 0 && (
-                  <div className="w-full bg-gray-700 rounded-full h-1.5">
-                    <div
-                      className="h-1.5 rounded-full transition-all duration-500"
-                      style={{ width: `${percentage}%`, backgroundColor: color }}
-                    />
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    );
-  }
+  const showSkeleton = (connectionsLoading || isLoading) && results.length === 0;
 
   return (
-    <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto w-full">
-      {/* Header */}
-      <header className="mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-white tracking-tight">Dashboard</h1>
-          <p className="text-sm text-gray-500 mt-1">Monitor your network instances in real-time.</p>
-        </div>
-        <div className="flex items-center bg-[#181A20] border border-[#2A2D35] rounded-lg p-1 shadow-sm">
-          <button
-            onClick={fetchAll}
-            disabled={isLoading}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md text-gray-300 hover:bg-white/5 transition-colors disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
-            {isLoading ? 'Loading...' : 'Refresh'}
-          </button>
-          <div className="w-px h-6 bg-[#2A2D35] mx-1" />
-          <button
-            onClick={() => toggleAllProtection(true)}
-            disabled={isLoading || connections.length === 0}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md text-[var(--primary)] hover:bg-[var(--primary)]/10 transition-colors disabled:opacity-50"
-          >
-            <Power className="w-4 h-4" /> Enable All
-          </button>
-          <button
-            onClick={() => toggleAllProtection(false)}
-            disabled={isLoading || connections.length === 0}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md text-red-500 hover:bg-red-500/10 transition-colors disabled:opacity-50"
-          >
-            <PowerOff className="w-4 h-4" /> Disable All
-          </button>
-        </div>
-      </header>
+    <div className="space-y-5">
+      <PageHeader
+        title="Dashboard"
+        description="Live status across every configured AdGuard Home instance."
+        actions={
+          <>
+            <Button
+              size="sm"
+              onClick={fetchAll}
+              disabled={isLoading}
+              icon={<RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />}
+            >
+              Refresh
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => toggleAll(true)}
+              loading={bulkAction === 'enable'}
+              disabled={connections.length === 0 || bulkAction !== null}
+              icon={<Power className="h-4 w-4" />}
+            >
+              Enable all
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              onClick={() => toggleAll(false)}
+              loading={bulkAction === 'disable'}
+              disabled={connections.length === 0 || bulkAction !== null}
+              icon={<PowerOff className="h-4 w-4" />}
+            >
+              Disable all
+            </Button>
+          </>
+        }
+      />
 
-      {/* Error message */}
-      {error && (
-        <div className="mb-6 p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400">
-          {error}
-        </div>
+      {error && <Alert tone="danger">{error}</Alert>}
+
+      {totals.unprotected > 0 && (
+        <Alert tone="warning" title="Protection is off">
+          {totals.unprotected} of {totals.total} servers currently have DNS protection disabled.
+        </Alert>
       )}
 
-      {/* Loading state */}
-      {isLoading && results.length === 0 && (
-        <div className="text-center py-12 text-[var(--primary)]">Loading connection statuses...</div>
-      )}
-
-      {/* Server Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {!isLoading && !error && results.map((res, idx) => {
-          let parsed: AdGuardServerStatus | null = null;
-          try {
-            parsed = JSON.parse(res.response);
-          } catch {
-            parsed = null;
-          }
-          const connId = res.url && res.url.length > 0 ? res.url.replace(/\/$/, '') : `${res.ip}${res.port ? ':' + res.port : ''}`;
-
-          return (
-            <div key={`${connId}-${idx}`} className="adguard-card flex flex-col">
-              {/* Card Header */}
-              <div className="pb-4 border-b border-[#2A2D35] flex justify-between items-start mb-4">
-                <div>
-                  <div className="flex items-center gap-3 mb-1">
-                    <Router className="w-5 h-5 text-gray-500" />
-                    <h2 className="text-lg font-bold text-white font-mono tracking-wide truncate max-w-[200px] sm:max-w-xs" title={connId}>
-                      {connId.length > 30 ? connId.substring(0, 30) + '...' : connId}
-                    </h2>
-                  </div>
-                  <div className="flex items-center gap-2 text-xs text-gray-500">
-                    <User className="w-3 h-3" />
-                    <span>User: <span className="font-mono text-[var(--primary)] font-semibold">{res.username}</span></span>
-                  </div>
-                </div>
-                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${res.status === "connected"
-                    ? "bg-emerald-900/30 text-emerald-400 border-emerald-800"
-                    : "bg-red-900/30 text-red-400 border-red-800"
-                  }`}>
-                  {res.status === "connected" && (
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 mr-1.5 animate-pulse" />
-                  )}
-                  {res.status === "connected" ? "Connected" : "Error"}
-                </span>
-              </div>
-
-              {/* Card Content */}
-              <div className="flex-grow space-y-4">
-                {parsed ? (
-                  <>
-                    <AdGuardStatusCard data={parsed} />
-                    {res.stats && <AdGuardStatsCard stats={res.stats} />}
-                  </>
-                ) : (
-                  <pre className="text-xs bg-[#0F1115] rounded p-3 overflow-x-auto max-h-40 whitespace-pre-wrap text-gray-400 border border-white/5">
-                    {res.response}
-                  </pre>
-                )}
-              </div>
-
-              {/* Card Footer */}
-              {parsed && (
-                <div className="mt-4 pt-4 border-t border-[#2A2D35] flex justify-between items-center">
-                  <span className="text-[10px] text-gray-500 font-mono">HTTP: {res.code || 200}</span>
-                  <button
-                    onClick={() => toggleProtection(res, !parsed.protection_enabled)}
-                    disabled={isLoading || updatingIp === connId}
-                    className={`px-3 py-1.5 rounded text-xs font-medium border transition-colors disabled:opacity-50
-                      ${parsed.protection_enabled
-                        ? 'bg-red-500/10 hover:bg-red-500/20 text-red-400 border-red-500/20'
-                        : 'bg-[var(--primary)]/10 hover:bg-[var(--primary)]/20 text-[var(--primary)] border-[var(--primary)]/20'
-                      }`}
-                  >
-                    {updatingIp === connId
-                      ? 'Updating...'
-                      : (parsed.protection_enabled ? 'Disable Protection' : 'Enable Protection')
-                    }
-                  </button>
-                </div>
-              )}
-            </div>
-          );
-        })}
-
-        {!isLoading && !error && connections.length === 0 && (
-          <div className="col-span-full text-center py-12 text-gray-500">
-            No connections configured. Go to Settings to add AdGuard Home instances.
-          </div>
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        {showSkeleton ? (
+          Array.from({ length: 4 }).map((_, i) => <StatTileSkeleton key={i} />)
+        ) : (
+          <>
+            <StatTile
+              label="Servers online"
+              value={`${totals.online}/${totals.total}`}
+              icon={<Server className="h-4 w-4" />}
+              tone={totals.online === totals.total && totals.total > 0 ? 'success' : 'warning'}
+            />
+            <StatTile
+              label="DNS queries"
+              value={numberFormat.format(totals.queries)}
+              icon={<Activity className="h-4 w-4" />}
+              tone="accent"
+            />
+            <StatTile
+              label="Blocked"
+              value={numberFormat.format(totals.blocked)}
+              hint={`${totals.blockedShare.toFixed(1)}%`}
+              icon={<ShieldCheck className="h-4 w-4" />}
+              tone="danger"
+            />
+            <StatTile
+              label="Avg. processing"
+              value={totals.avgLatencyMs.toFixed(1)}
+              unit="ms"
+              icon={<Timer className="h-4 w-4" />}
+              tone="info"
+            />
+          </>
         )}
       </div>
-    </main>
+
+      <Card flush>
+        <div className="px-5 pt-5">
+          <CardHeader
+            title="Servers"
+            description="Expand a row for version, ports and DNS addresses."
+            icon={<ServerCog className="h-4 w-4" />}
+          />
+        </div>
+
+        {showSkeleton ? (
+          <TableSkeleton rows={4} />
+        ) : connections.length === 0 ? (
+          <EmptyState
+            icon={<Server className="h-5 w-5" />}
+            title="No connections configured"
+            description="Add your AdGuard Home instances in Settings to start monitoring them."
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th scope="col" className="w-8" />
+                  <th scope="col">Server</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Protection</th>
+                  <th scope="col" className="num">Queries</th>
+                  <th scope="col" className="num">Blocked</th>
+                  <th scope="col">Last 24h</th>
+                  <th scope="col" className="text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {results.map(result => (
+                  <ServerRow
+                    key={result.connection.id}
+                    result={result}
+                    expanded={expandedId === result.connection.id}
+                    onToggleExpanded={() =>
+                      setExpandedId(current => current === result.connection.id ? null : result.connection.id)}
+                    updating={updatingId === result.connection.id}
+                    onToggleProtection={toggleProtection}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function ServerRow({
+  result, expanded, onToggleExpanded, updating, onToggleProtection,
+}: {
+  result: ServerResult;
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  updating: boolean;
+  onToggleProtection: (id: string, enabled: boolean) => void;
+}) {
+  const { connection, info, stats, status } = result;
+  const protectionOn = info?.protection_enabled ?? false;
+  const queries = stats?.num_dns_queries || 0;
+  const blocked = stats?.num_blocked_filtering || 0;
+  const trend = Array.isArray(stats?.dns_queries) ? stats!.dns_queries!.slice(-24) : [];
+
+  return (
+    <>
+      <tr>
+        <td>
+          <IconButton
+            icon={expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+            label={expanded ? `Collapse ${connection.id}` : `Expand ${connection.id}`}
+            onClick={onToggleExpanded}
+          />
+        </td>
+        <td>
+          <span className="block max-w-[240px] truncate font-mono text-[13px] text-[var(--text)]" title={connection.id}>
+            {connectionLabel(connection)}
+          </span>
+          <span className="text-[12px] text-[var(--text-subtle)]">{connection.username}</span>
+        </td>
+        <td>
+          {status === 'connected' ? (
+            <Badge tone="success" dot pulse>Connected</Badge>
+          ) : (
+            <Badge tone="danger" dot>Error</Badge>
+          )}
+        </td>
+        <td>
+          {info ? (
+            <Badge tone={protectionOn ? 'success' : 'danger'}>{protectionOn ? 'Active' : 'Disabled'}</Badge>
+          ) : (
+            <span className="text-[var(--text-subtle)]">—</span>
+          )}
+        </td>
+        <td className="num text-[var(--text)]">{queries ? numberFormat.format(queries) : '—'}</td>
+        <td className="num">
+          {blocked ? (
+            <>
+              <span className="text-[var(--text)]">{numberFormat.format(blocked)}</span>
+              <span className="ml-1.5 text-[var(--text-subtle)]">
+                {queries > 0 ? `${((blocked / queries) * 100).toFixed(0)}%` : ''}
+              </span>
+            </>
+          ) : '—'}
+        </td>
+        <td>
+          {trend.length > 1
+            ? <Sparkline values={trend} ariaLabel={`Query trend for ${connection.id}`} />
+            : <span className="text-[var(--text-subtle)]">—</span>}
+        </td>
+        <td className="text-right">
+          {info && (
+            <Button
+              size="sm"
+              variant={protectionOn ? 'danger' : 'secondary'}
+              loading={updating}
+              onClick={() => onToggleProtection(connection.id, !protectionOn)}
+            >
+              {protectionOn ? 'Disable' : 'Enable'}
+            </Button>
+          )}
+        </td>
+      </tr>
+
+      {expanded && (
+        <tr>
+          <td colSpan={8} style={{ background: 'var(--surface-2)' }}>
+            {info ? <ServerDetails info={info} httpCode={result.code} /> : (
+              <div className="flex items-start gap-2 py-2 text-[13px] text-[var(--danger)]">
+                <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
+                <span className="break-all">{result.message || 'The server did not return a readable status.'}</span>
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function ServerDetails({ info, httpCode }: { info: AdGuardServerStatus; httpCode?: number }) {
+  const rows: [string, React.ReactNode][] = [
+    ['Version', info.version || '—'],
+    ['Language', info.language || '—'],
+    ['DNS port', info.dns_port ?? '—'],
+    ['HTTP port', info.http_port ?? '—'],
+    ['Running', info.running ? 'Yes' : 'No'],
+    ['DHCP', info.dhcp_available ? 'Available' : 'Not available'],
+    ['HTTP status', httpCode ?? '—'],
+  ];
+
+  return (
+    <div className="grid gap-5 py-2 lg:grid-cols-2">
+      <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-[13px]">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex justify-between gap-3 border-b border-[var(--border)] pb-1.5">
+            <dt className="text-[var(--text-subtle)]">{label}</dt>
+            <dd className="tabular font-mono text-[var(--text)]">{value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      {Array.isArray(info.dns_addresses) && info.dns_addresses.length > 0 && (
+        <div>
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--text-subtle)]">
+            DNS addresses
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {info.dns_addresses.map((address, index) => (
+              <span
+                key={index}
+                className="select-all rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg)] px-2 py-1 font-mono text-[12px] text-[var(--text-muted)]"
+              >
+                {address}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

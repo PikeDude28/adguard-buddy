@@ -1,383 +1,73 @@
 import { POST } from '../route';
-import { NextRequest } from 'next/server';
+import { httpRequest } from '@/lib/httpRequest';
+import { resolveConnection } from '@/lib/serverConnections';
 
-// Mock the logger
+jest.mock('@/lib/httpRequest');
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  resolveConnection: jest.fn(),
+}));
 jest.mock('../../logger', () => ({
-  info: jest.fn(),
-  error: jest.fn(),
-  warn: jest.fn(),
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-// Mock http and https modules
-jest.mock('http', () => ({
-  request: jest.fn(),
-}));
-jest.mock('https', () => ({
-  request: jest.fn(),
-}));
+const mockHttpRequest = httpRequest as jest.MockedFunction<typeof httpRequest>;
+const mockResolve = resolveConnection as jest.MockedFunction<typeof resolveConnection>;
 
-const mockHttpRequest = require('http').request as jest.MockedFunction<any>;
-const mockHttpsRequest = require('https').request as jest.MockedFunction<any>;
+const request = (body: unknown) => ({ json: async () => body }) as never;
 
-describe('/api/adguard-control', () => {
+const CONNECTION = { ip: '10.0.0.1', port: 3000, username: 'admin', password: 'pw', allowInsecure: false };
+
+describe('POST /api/adguard-control', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockResolve.mockResolvedValue(CONNECTION);
   });
 
-  it('should handle invalid JSON in request', async () => {
-    const mockRequest = {
-      json: jest.fn().mockRejectedValue(new Error('Invalid JSON')),
-    } as unknown as NextRequest;
+  it('posts the requested protection state to dns_config', async () => {
+    mockHttpRequest.mockResolvedValue({ statusCode: 200, headers: {}, body: '{}' });
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(500);
-    expect(result.status).toBe('error');
-    expect(result.message).toContain('Internal server error');
-  });
-
-  it('should handle missing required fields', async () => {
-    // Mock the request to simulate network failure
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'error') {
-          // Immediately call the error callback
-          setImmediate(() => callback(new Error('Network error')));
-        }
-      }),
-    };
-    mockHttpRequest.mockReturnValue(mockReq);
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        // missing protection_enabled
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(502); // Network error returns 502
-    expect(result.status).toBe('error');
-    expect(result.message).toContain('Failed to reach AdGuard Home');
-  });
-
-  it('should successfully update protection status with IP', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 200,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('{"protection_enabled": true}');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
-
-    mockHttpRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 80,
-        protection_enabled: true,
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
+    const response = await POST(request({ connectionId: '10.0.0.1:3000', protection_enabled: false }));
 
     expect(response.status).toBe(200);
-    expect(result.status).toBe('success');
-    expect(result.message).toBe('Protection status updated successfully.');
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: 'POST',
-        hostname: '192.168.1.1',
-        port: 80,
-        path: '/control/dns_config',
-        headers: expect.objectContaining({
-          'Content-Type': 'application/json',
-        }),
-      }),
-      expect.any(Function)
-    );
+    expect(mockHttpRequest).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'POST',
+      url: 'http://10.0.0.1:3000/control/dns_config',
+      body: JSON.stringify({ protection_enabled: false }),
+    }));
   });
 
-  it('should successfully update protection status with URL', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 200,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('{"protection_enabled": false}');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
-
-    mockHttpRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        url: 'http://adguard.example.com:8080',
-        protection_enabled: false,
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.status).toBe('success');
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        hostname: 'adguard.example.com',
-        port: 8080,
-        path: '/control/dns_config',
-      }),
-      expect.any(Function)
-    );
-  });
-
-  it('should handle authentication with username and password', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 200,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('{"protection_enabled": true}');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
-
-    mockHttpRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        username: 'admin',
-        password: 'secret',
-        protection_enabled: true,
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.status).toBe('success');
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from('admin:secret').toString('base64'),
-        }),
-      }),
-      expect.any(Function)
-    );
-  });
-
-  it('should handle AdGuard Home error response', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 400,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('Invalid request parameters');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
-
-    mockHttpRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        protection_enabled: true,
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
+  it('rejects a non-boolean protection_enabled', async () => {
+    const response = await POST(request({ connectionId: '10.0.0.1:3000', protection_enabled: 'yes' }));
     expect(response.status).toBe(400);
-    expect(result.status).toBe('error');
-    expect(result.message).toContain('Failed to update AdGuard Home protection status');
+    expect(mockHttpRequest).not.toHaveBeenCalled();
   });
 
-  it('should handle HTTPS requests with allowInsecure flag', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 200,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('{"protection_enabled": true}');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
-
-    mockHttpsRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
-
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        url: 'https://adguard.example.com',
-        protection_enabled: true,
-        allowInsecure: true,
-      }),
-    } as unknown as NextRequest;
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.status).toBe('success');
-    expect(mockHttpsRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        hostname: 'adguard.example.com',
-        port: 443,
-        rejectUnauthorized: false,
-      }),
-      expect.any(Function)
-    );
+  it('rejects a missing connectionId', async () => {
+    const response = await POST(request({ protection_enabled: true }));
+    expect(response.status).toBe(400);
   });
 
-  it('should handle custom port configuration', async () => {
-    const mockReq = {
-      write: jest.fn(),
-      end: jest.fn(),
-      on: jest.fn((event: any, callback: any) => {
-        if (event === 'error') {
-          (mockReq as any).errorCallback = callback;
-        }
-      }),
-    };
-    const mockRes = {
-      statusCode: 200,
-      headers: {},
-      setEncoding: jest.fn(),
-      on: jest.fn((event, callback) => {
-        if (event === 'data') {
-          callback('{"protection_enabled": true}');
-        } else if (event === 'end') {
-          callback();
-        }
-      }),
-    };
+  it('returns 404 for an unknown connection', async () => {
+    mockResolve.mockResolvedValue(null);
+    const response = await POST(request({ connectionId: 'ghost', protection_enabled: true }));
+    expect(response.status).toBe(404);
+  });
 
-    mockHttpRequest.mockImplementation((options: any, callback: any) => {
-      setTimeout(() => {
-        callback(mockRes);
-      }, 10);
-      return mockReq;
-    });
+  it('propagates a non-2xx status from AdGuard', async () => {
+    mockHttpRequest.mockResolvedValue({ statusCode: 403, headers: {}, body: 'forbidden' });
 
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue({
-        ip: '192.168.1.1',
-        port: 8080,
-        protection_enabled: true,
-      }),
-    } as unknown as NextRequest;
+    const response = await POST(request({ connectionId: '10.0.0.1:3000', protection_enabled: true }));
+    const data = await response.json();
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
+    expect(response.status).toBe(403);
+    expect(data.message).toContain('forbidden');
+  });
 
-    expect(response.status).toBe(200);
-    expect(result.status).toBe('success');
-    expect(mockHttpRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        hostname: '192.168.1.1',
-        port: 8080,
-      }),
-      expect.any(Function)
-    );
+  it('returns 502 when the server cannot be reached', async () => {
+    mockHttpRequest.mockRejectedValue(new Error('ETIMEDOUT'));
+    const response = await POST(request({ connectionId: '10.0.0.1:3000', protection_enabled: true }));
+    expect(response.status).toBe(502);
   });
 });

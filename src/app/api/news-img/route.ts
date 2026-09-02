@@ -10,6 +10,8 @@ function getContentType(filename: string) {
   return 'application/octet-stream';
 }
 
+export const runtime = 'nodejs';
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
@@ -18,7 +20,13 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: 'Invalid or missing name parameter' }, { status: 400 });
     }
 
-    const imagePath = path.join(process.cwd(), 'pics', name);
+    const picsDir = path.join(process.cwd(), 'pics');
+    const imagePath = path.resolve(picsDir, name);
+    // Defence in depth: the name pattern already rejects separators, but a
+    // containment check makes the guarantee explicit.
+    if (!imagePath.startsWith(picsDir + path.sep)) {
+      return NextResponse.json({ error: 'Invalid name parameter' }, { status: 400 });
+    }
     const buffer = await fs.readFile(imagePath);
     const contentType = getContentType(name);
 

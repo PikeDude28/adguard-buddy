@@ -1,97 +1,69 @@
 import { GET } from '../route';
+import { getPublicStore } from '@/lib/serverConnections';
 
-// Mock logger
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  getPublicStore: jest.fn(),
+}));
 jest.mock('../../logger', () => ({
-  info: jest.fn(),
-  error: jest.fn(),
-  warn: jest.fn(),
-  debug: jest.fn(),
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-// Mock fs and path
-jest.mock('fs', () => ({
-  promises: {
-    stat: jest.fn(),
-    readFile: jest.fn(),
-    writeFile: jest.fn(),
-  },
-}));
-jest.mock('path', () => ({
-  join: jest.fn(),
-}));
+const mockGetPublicStore = getPublicStore as jest.MockedFunction<typeof getPublicStore>;
 
-const mockFs = require('fs').promises;
-const mockPath = require('path');
+describe('GET /api/get-connections', () => {
+  beforeEach(() => jest.clearAllMocks());
 
-// Mock process.cwd
-const originalProcess = process;
-Object.defineProperty(process, 'cwd', {
-  value: jest.fn(() => '/mock/cwd'),
-  writable: true,
-});
+  it('returns the public view of the store', async () => {
+    mockGetPublicStore.mockResolvedValue({
+      connections: [{ id: '10.0.0.1:80', ip: '10.0.0.1', port: 80, username: 'admin' }],
+      masterServerIp: '10.0.0.1:80',
+    });
 
-mockPath.join.mockImplementation((...args: string[]) => {
-  if (args[0] === '/mock/cwd' && args[1] === '.data' && args[2] === 'connections.json') {
-    return '/mock/cwd/.data/connections.json';
-  }
-  return args.join('/');
-});
+    const data = await (await GET()).json();
 
-describe('/api/get-connections', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockPath.join.mockReturnValue('/mock/path/connections.json');
+    expect(data.masterServerIp).toBe('10.0.0.1:80');
+    expect(data.connections).toHaveLength(1);
   });
 
-  it('should return connections data when file exists', async () => {
-    const mockData = { connections: [{ ip: '192.168.1.1' }], masterServerIp: '192.168.1.100' };
+  it('never exposes a password field', async () => {
+    mockGetPublicStore.mockResolvedValue({
+      connections: [{ id: 'https://a.test', url: 'https://a.test', username: 'admin' }],
+      masterServerIp: null,
+    });
 
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue(JSON.stringify(mockData));
+    const data = await (await GET()).json();
 
-    const response = await GET();
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result).toEqual(mockData);
-    expect(mockFs.stat).toHaveBeenCalled();
-    expect(mockFs.readFile).toHaveBeenCalled();
+    expect(JSON.stringify(data)).not.toContain('password');
+    expect(data.connections[0]).not.toHaveProperty('password');
   });
 
-  it('should return default empty state when file does not exist', async () => {
-    const error = new Error('File not found') as NodeJS.ErrnoException;
-    error.code = 'ENOENT';
-    mockFs.stat.mockRejectedValue(error);
+  it('returns an empty store when nothing is configured', async () => {
+    mockGetPublicStore.mockResolvedValue({ connections: [], masterServerIp: null });
 
-    const response = await GET();
-    const result = await response.json();
+    const data = await (await GET()).json();
 
-    expect(response.status).toBe(200);
-    expect(result).toEqual({ connections: [], masterServerIp: null });
+    expect(data).toEqual({ connections: [], masterServerIp: null });
   });
 
-  it('should return error when stat fails with non-ENOENT error', async () => {
-    const error = new Error('Permission denied') as NodeJS.ErrnoException;
-    error.code = 'EACCES';
-    mockFs.stat.mockRejectedValue(error);
+  it('returns 500 with a parse message for corrupt JSON', async () => {
+    mockGetPublicStore.mockRejectedValue(new SyntaxError('Unexpected token'));
 
     const response = await GET();
-    const result = await response.json();
+    const data = await response.json();
 
     expect(response.status).toBe(500);
-    expect(result.message).toBe('Failed to read connections file.');
-    expect(result.error).toBe('Permission denied');
+    expect(data.message).toBe('Failed to parse connections data.');
   });
 
-  it('should return error when JSON parsing fails', async () => {
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.readFile.mockResolvedValue('invalid json');
+  it('returns 500 for a read failure', async () => {
+    mockGetPublicStore.mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
 
     const response = await GET();
-    const result = await response.json();
+    const data = await response.json();
 
     expect(response.status).toBe(500);
-    expect(result.message).toBe('Failed to parse connections data.');
-    expect(result.error).toContain('Unexpected token');
+    expect(data.message).toBe('Failed to read connections file.');
   });
 });
