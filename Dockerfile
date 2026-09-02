@@ -3,7 +3,9 @@
 FROM node:20-bookworm-slim AS deps
 WORKDIR /app
 RUN corepack enable
-COPY package.json pnpm-lock.yaml ./
+# pnpm-workspace.yaml carries the dependency overrides; without it
+# --frozen-lockfile fails with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 FROM node:20-bookworm-slim AS builder
