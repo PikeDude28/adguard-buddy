@@ -1,3 +1,12 @@
 node_modules
 .pnpm-store
 .data
+.next
+logs
+coverage
+.git
+.github
+*.md
+!docs/News.md
+Dockerfile
+.dockerignore

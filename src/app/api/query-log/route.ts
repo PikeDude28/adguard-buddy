@@ -1,58 +1,63 @@
 import { NextRequest, NextResponse } from "next/server";
 import logger from "../logger";
-import { httpRequest } from '../../lib/httpRequest';
+import { httpRequest } from "@/lib/httpRequest";
+import { authHeaders, buildBaseUrl } from "@/lib/serverConnections";
+import { connectionFromBody, errorResponse } from "@/lib/apiConnection";
+import { asObject, optionalEnum, optionalInt } from "@/lib/validation";
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const RESPONSE_STATUSES = [
+  'all', 'filtered', 'blocked', 'blocked_safebrowsing', 'blocked_parental',
+  'whitelisted', 'rewritten', 'safe_search', 'processed',
+] as const;
+
+/**
+ * Fetches the query log for one stored connection.
+ * Body: { connectionId, limit?, offset?, response_status? }
+ */
 export async function POST(req: NextRequest) {
   try {
-    const {
-      ip,
-      url,
-      username,
-      password,
-      port = 80,
-      limit = 100,
-      offset = 0,
-      response_status = 'all',
-      allowInsecure = false,
-    } = await req.json();
+    const body = await req.json();
+    const parsed = asObject(body);
+    const limit = optionalInt(parsed, 'limit', { min: 1, max: 5000 }) ?? 100;
+    const offset = optionalInt(parsed, 'offset', { min: 0, max: 1_000_000 }) ?? 0;
+    const responseStatus = optionalEnum(parsed, 'response_status', RESPONSE_STATUSES) ?? 'all';
 
-    const base = url && url.length > 0 ? url.replace(/\/$/, '') : `http://${ip}:${port}`;
-    logger.info(`POST /query-log called for target: ${base}, limit: ${limit}, offset: ${offset}, response_status: ${response_status}`);
+    const { connection, error } = await connectionFromBody(body);
+    if (error) return error;
+
+    const base = buildBaseUrl(connection);
+    logger.info(`POST /query-log called for target: ${base}, limit: ${limit}, offset: ${offset}, response_status: ${responseStatus}`);
 
     const params = new URLSearchParams({
       limit: String(limit),
       offset: String(offset),
-      response_status: response_status,
+      response_status: responseStatus,
     });
-
     const fullUrl = `${base}/control/querylog?${params.toString()}`;
 
-    const headers: Record<string, string> = {};
-    if (username && password) {
-      headers["Authorization"] =
-        "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
-    }
-
     try {
-      const res = await httpRequest({ method: 'GET', url: fullUrl, headers, allowInsecure });
+      const res = await httpRequest({
+        method: 'GET',
+        url: fullUrl,
+        headers: authHeaders(connection),
+        allowInsecure: connection.allowInsecure,
+      });
       if (res.statusCode < 200 || res.statusCode >= 300) {
         logger.warn(`AdGuard Home responded with status ${res.statusCode} for ${fullUrl}`);
         return NextResponse.json({ status: 'error', message: 'Failed to fetch query log from AdGuard Home' }, { status: 502 });
       }
-      const data = JSON.parse(res.body || '{}');
       logger.info(`Query log fetched successfully for target: ${base}`);
-      return NextResponse.json(data);
+      return NextResponse.json(JSON.parse(res.body || '{}'));
     } catch (fetchError) {
-      logger.error(`Fetch error for AdGuard Home query-log: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`);
-      return NextResponse.json({ status: 'error', message: `Failed to reach AdGuard Home: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}` }, { status: 502 });
+      const message = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      logger.error(`Fetch error for AdGuard Home query-log: ${message}`);
+      return NextResponse.json({ status: 'error', message: `Failed to reach AdGuard Home: ${message}` }, { status: 502 });
     }
-
   } catch (error) {
-    let errorMessage = "An unknown error occurred.";
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    }
-    logger.error(`Internal server error in /query-log: ${errorMessage}`);
-    return NextResponse.json({ status: 'error', message: `Internal server error: ${errorMessage}` }, { status: 500 });
+    logger.error(`Internal server error in /query-log: ${error instanceof Error ? error.message : String(error)}`);
+    return errorResponse(error, 'Internal server error');
   }
 }

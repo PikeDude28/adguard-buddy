@@ -1,173 +1,75 @@
 import { render, screen, fireEvent } from '@testing-library/react';
-import PageControls from '../PageControls';
+import PageControls, { type QueryLogOptions } from '../PageControls';
 
-const mockProps = {
-  mode: 'single' as const,
-  setMode: jest.fn(),
-  connectionsCount: 2,
-  selectedId: 'server1',
-  onSelectId: jest.fn(),
+const OPTIONS: QueryLogOptions = {
   refreshInterval: 5000,
-  onSetRefreshInterval: jest.fn(),
-  concurrency: 3,
-  setConcurrency: jest.fn(),
-  perServerLimit: 50,
-  setPerServerLimit: jest.fn(),
-  combinedMax: 250,
-  setCombinedMax: jest.fn(),
-  pageSize: 25,
-  setPageSize: jest.fn(),
-  connections: [
-    { ip: '192.168.1.1', port: 8080, username: 'admin' },
-    { url: 'http://server2.com', username: 'user' },
-  ],
+  perServerLimit: 100,
+  concurrency: 5,
+  combinedMax: 500,
+  pageSize: 50,
 };
 
 describe('PageControls', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
+  const onChange = jest.fn();
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('renders the always-available options', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined={false} />);
+
+    expect(screen.getByLabelText('Auto refresh')).toHaveValue('5000');
+    expect(screen.getByLabelText('Rows per server')).toHaveValue('100');
+    expect(screen.getByLabelText('Page size')).toHaveValue('50');
   });
 
-  it('renders mode toggle buttons', () => {
-    render(<PageControls {...mockProps} />);
+  it('does not offer server selection - that lives in the global scope picker', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined={false} />);
 
-    expect(screen.getByText('Single')).toBeInTheDocument();
-    expect(screen.getByText('Combined')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Server/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Single')).not.toBeInTheDocument();
   });
 
-  it('calls setMode when clicking mode buttons', () => {
-    render(<PageControls {...mockProps} />);
+  it('hides the multi-server options in single scope', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined={false} />);
 
-    fireEvent.click(screen.getByText('Combined'));
-    expect(mockProps.setMode).toHaveBeenCalledWith('combined');
-
-    fireEvent.click(screen.getByText('Single'));
-    expect(mockProps.setMode).toHaveBeenCalledWith('single');
-  });
-
-  it('disables combined mode when connectionsCount < 2', () => {
-    render(<PageControls {...mockProps} connectionsCount={1} />);
-
-    const combinedButton = screen.getByText('Combined').closest('button');
-    expect(combinedButton).toBeDisabled();
-  });
-
-  it('renders server select in single mode', () => {
-    render(<PageControls {...mockProps} />);
-
-    expect(screen.getByLabelText('Server')).toBeInTheDocument();
-    expect(screen.getByDisplayValue(/192\.168\.1\.1:8080/)).toBeInTheDocument();
-  });
-
-  it('renders server count display in combined mode', () => {
-    render(<PageControls {...mockProps} mode="combined" />);
-
-    expect(screen.getByText('Servers')).toBeInTheDocument();
-    expect(screen.getByText('2 servers selected')).toBeInTheDocument();
-  });
-
-  it('calls onSelectId when server selection changes', () => {
-    render(<PageControls {...mockProps} />);
-
-    const select = screen.getByLabelText('Server');
-    fireEvent.change(select, { target: { value: 'http://server2.com' } });
-
-    expect(mockProps.onSelectId).toHaveBeenCalledWith('http://server2.com');
-  });
-
-  it('renders refresh interval select with correct options', () => {
-    render(<PageControls {...mockProps} />);
-
-    const select = screen.getByLabelText('Refresh');
-    expect(select).toHaveValue('5000');
-
-    expect(screen.getByText('2 Seconds')).toBeInTheDocument();
-    expect(screen.getByText('5 Seconds')).toBeInTheDocument();
-    expect(screen.getByText('10 Seconds')).toBeInTheDocument();
-    expect(screen.getByText('30 Seconds')).toBeInTheDocument();
-    expect(screen.getByText('Off')).toBeInTheDocument();
-  });
-
-  it('calls onSetRefreshInterval when refresh interval changes', () => {
-    render(<PageControls {...mockProps} />);
-
-    const select = screen.getByLabelText('Refresh');
-    fireEvent.change(select, { target: { value: '10000' } });
-
-    expect(mockProps.onSetRefreshInterval).toHaveBeenCalledWith(10000);
-  });
-
-  it('renders combined mode controls when mode is combined', () => {
-    render(<PageControls {...mockProps} mode="combined" />);
-
-    expect(screen.getByLabelText('Concurrency')).toBeInTheDocument();
-    expect(screen.getByText('Limit')).toBeInTheDocument();
-    expect(screen.getByText('Max Total')).toBeInTheDocument();
-  });
-
-  it('renders single mode controls when mode is single', () => {
-    render(<PageControls {...mockProps} mode="single" />);
-
-    expect(screen.getByText('Limit')).toBeInTheDocument();
     expect(screen.queryByLabelText('Concurrency')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Max total rows')).not.toBeInTheDocument();
   });
 
-  it('calls setConcurrency when concurrency changes', () => {
-    render(<PageControls {...mockProps} mode="combined" />);
+  it('shows the multi-server options in combined scope', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined />);
 
-    const select = screen.getByLabelText('Concurrency');
-    fireEvent.change(select, { target: { value: '5' } });
-
-    expect(mockProps.setConcurrency).toHaveBeenCalledWith(5);
+    expect(screen.getByLabelText('Concurrency')).toHaveValue('5');
+    expect(screen.getByLabelText('Max total rows')).toHaveValue('500');
   });
 
-  it('calls setPerServerLimit when per server limit changes', () => {
-    render(<PageControls {...mockProps} mode="single" />);
+  it.each([
+    ['Auto refresh', '10000', { refreshInterval: 10000 }],
+    ['Rows per server', '200', { perServerLimit: 200 }],
+    ['Page size', '25', { pageSize: 25 }],
+  ])('reports a change to %s as a numeric patch', (label, value, expected) => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined={false} />);
 
-    const select = screen.getByDisplayValue('50 per server');
-    fireEvent.change(select, { target: { value: '100' } });
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
-    expect(mockProps.setPerServerLimit).toHaveBeenCalledWith(100);
+    expect(onChange).toHaveBeenCalledWith(expected);
   });
 
-  it('calls setCombinedMax when combined max changes', () => {
-    render(<PageControls {...mockProps} mode="combined" />);
+  it('reports combined-only changes', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined />);
 
-    const select = screen.getByDisplayValue('250 total');
-    fireEvent.change(select, { target: { value: '500' } });
+    fireEvent.change(screen.getByLabelText('Concurrency'), { target: { value: '10' } });
+    expect(onChange).toHaveBeenCalledWith({ concurrency: 10 });
 
-    expect(mockProps.setCombinedMax).toHaveBeenCalledWith(500);
+    fireEvent.change(screen.getByLabelText('Max total rows'), { target: { value: '1000' } });
+    expect(onChange).toHaveBeenCalledWith({ combinedMax: 1000 });
   });
 
-  it('disables server select when connectionsCount is 0', () => {
-    render(<PageControls {...mockProps} connectionsCount={0} />);
+  it('offers turning auto refresh off', () => {
+    render(<PageControls options={OPTIONS} onChange={onChange} combined={false} />);
 
-    const select = screen.getByLabelText('Server');
-    expect(select).toBeDisabled();
-  });
+    fireEvent.change(screen.getByLabelText('Auto refresh'), { target: { value: '0' } });
 
-  it('displays connection details correctly in server options', () => {
-    render(<PageControls {...mockProps} />);
-
-    // Should show IP:port format for first connection
-    expect(screen.getByText(/192\.168\.1\.1:8080/)).toBeInTheDocument();
-
-    // Should show URL for second connection
-    expect(screen.getByText(/http:\/\/server2\.com/)).toBeInTheDocument();
-  });
-
-  it('handles connections with missing data gracefully', () => {
-    const propsWithIncompleteData = {
-      ...mockProps,
-      connections: [
-        { username: 'admin' }, // Missing IP and URL
-        { ip: '192.168.1.2', username: 'user2' }, // Missing port
-      ],
-    };
-
-    render(<PageControls {...propsWithIncompleteData} />);
-
-    expect(screen.getByText('admin (admin)')).toBeInTheDocument();
-    expect(screen.getByText(/192\.168\.1\.2/)).toBeInTheDocument();
+    expect(onChange).toHaveBeenCalledWith({ refreshInterval: 0 });
   });
 });

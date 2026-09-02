@@ -1,587 +1,203 @@
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import QueryLogPage from '../page';
+import { useConnections } from '../../contexts/ConnectionsContext';
+import { connection, mockConnectionsValue, renderWithProviders } from '../../../test-utils';
 
-// Mock dependencies
-jest.mock('@/app/components/NavMenu', () => ({
-  __esModule: true,
-  default: () => <nav data-testid="nav-menu">Navigation</nav>,
+jest.mock('../../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
 }));
 
-jest.mock('../PageControls', () => ({
-  __esModule: true,
-  default: ({ onRefresh }: { onRefresh: () => void }) => (
-    <div data-testid="page-controls">
-      <button onClick={onRefresh} data-testid="refresh-button">Refresh</button>
-    </div>
-  ),
-}));
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
-// Mock crypto-js
-jest.mock('crypto-js', () => ({
-  AES: {
-    encrypt: jest.fn(() => 'encrypted-password'),
-    decrypt: jest.fn(() => ({
-      toString: jest.fn(() => 'decrypted-password'),
-    })),
+const LOGS = [
+  {
+    question: { name: 'ads.example' },
+    client: '192.168.1.50',
+    time: '2026-01-01T10:00:00Z',
+    reason: 'FilteredBlackList',
   },
-  enc: {
-    Utf8: 'utf8',
+  {
+    question: { name: 'cdn.example' },
+    client: '192.168.1.51',
+    time: '2026-01-01T09:00:00Z',
+    reason: 'NotFilteredNotFound',
   },
-}));
+];
 
-// Mock fetch
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
+const jsonResponse = (json: unknown, ok = true, status = 200) =>
+  ({ ok, status, json: async () => json, text: async () => JSON.stringify(json) }) as unknown as Response;
 
 describe('QueryLogPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch.mockClear();
+    mockUseConnections.mockReturnValue(mockConnectionsValue());
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ data: LOGS }));
   });
 
-  it('renders the query log page with navigation', async () => {
-    mockFetch.mockResolvedValueOnce({
+  afterEach(() => jest.useRealTimers());
+
+  it('fetches by connection id without credentials', async () => {
+    renderWithProviders(<QueryLogPage />);
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
+    const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+    const body = JSON.parse(init.body);
+
+    expect(body.connectionId).toBe('192.168.1.1:80');
+    expect(body).not.toHaveProperty('password');
+    expect(body).not.toHaveProperty('username');
+  });
+
+  it('renders the log rows with readable statuses', async () => {
+    renderWithProviders(<QueryLogPage />);
+
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+    // Scoped to the table: "Processed" is also a filter tab label.
+    const table = screen.getByRole('table');
+    expect(within(table).getByText('Blocked')).toBeInTheDocument();
+    expect(within(table).getByText('Processed')).toBeInTheDocument();
+  });
+
+  it('hides the server column in single scope', async () => {
+    renderWithProviders(<QueryLogPage />);
+
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+    expect(screen.queryByRole('columnheader', { name: 'Server' })).not.toBeInTheDocument();
+  });
+
+  it('shows the server column and queries every server in combined scope', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      mode: 'combined',
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
+
+    renderWithProviders(<QueryLogPage />);
+
+    await waitFor(() => expect(screen.getByRole('columnheader', { name: 'Server' })).toBeInTheDocument());
+    const logCalls = (global.fetch as jest.Mock).mock.calls
+      .filter(([url]) => String(url).includes('/api/query-log'));
+    expect(logCalls).toHaveLength(2);
+  });
+
+  it('filters rows by the search term', async () => {
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText('Search queries'), { target: { value: 'cdn' } });
+
+    expect(screen.queryByText('ads.example')).not.toBeInTheDocument();
+    expect(screen.getByText('cdn.example')).toBeInTheDocument();
+  });
+
+  it('sends the selected status filter to the API', async () => {
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Filtered' }));
+
+    await waitFor(() => {
+      const last = (global.fetch as jest.Mock).mock.calls.at(-1);
+      expect(JSON.parse(last[1].body).response_status).toBe('filtered');
+    });
+  });
+
+  it('confirms before writing a rule and says it affects every server', async () => {
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+
+    fireEvent.click(screen.getAllByRole('button', { name: /Unblock/ })[0]);
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(/all 1 configured server/)).toBeInTheDocument();
+
+    // Nothing is written until the user confirms.
+    expect((global.fetch as jest.Mock).mock.calls.some(([url]) =>
+      String(url).includes('set-filtering-rule'))).toBe(false);
+  });
+
+  it('cancelling the confirmation writes nothing', async () => {
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+
+    fireEvent.click(screen.getAllByRole('button', { name: /Block/ })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect((global.fetch as jest.Mock).mock.calls.some(([url]) =>
+      String(url).includes('set-filtering-rule'))).toBe(false);
+  });
+
+  it('posts the rule with every connection id after confirming', async () => {
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
+
+    (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+      status: 200,
+      body: null,
+      json: async () => ({}),
+    } as unknown as Response);
 
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('fetches connections on mount', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections }),
-    });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
+    fireEvent.click(screen.getAllByRole('button', { name: /Unblock/ })[0]);
+    fireEvent.click(screen.getByRole('button', { name: /Unblock everywhere/ }));
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-  });
-
-  it('handles fetch connections error gracefully', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should still render the page even with fetch error
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('renders connection selector when connections exist', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections }),
-    });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render connection selector
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('fetches logs in single mode when connection is selected', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
+      const call = (global.fetch as jest.Mock).mock.calls
+        .find(([url]) => String(url).includes('set-filtering-rule'));
+      expect(JSON.parse(call[1].body)).toEqual({
+        domain: 'ads.example',
+        action: 'unblock',
+        connectionIds: ['192.168.1.1:80'],
       });
-
-    await act(async () => {
-      render(<QueryLogPage />);
     });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should be able to fetch logs
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
   });
 
-  it('handles log fetch error gracefully', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('shows an empty state when there are no logs', async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ data: [] }));
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        json: () => Promise.resolve({ message: 'API Error' }),
-      });
+    renderWithProviders(<QueryLogPage />);
 
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle API errors gracefully
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No queries logged')).toBeInTheDocument());
   });
 
-  it('renders filter controls', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('reports a failed fetch', async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ message: 'Upstream error' }, false, 502));
 
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
+    renderWithProviders(<QueryLogPage />);
 
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render filter controls
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/Upstream error/)).toBeInTheDocument());
   });
 
-  it('renders page controls component', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('offers server colours only where the server column is shown', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
 
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByText('ads.example')).toBeInTheDocument());
 
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render page controls
-    expect(screen.getByTestId('page-controls')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Colour for 192.168.1.1:80')).not.toBeInTheDocument();
   });
 
-  it('handles combined mode with multiple connections', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('persists a server colour against the connection id', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      mode: 'combined',
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
 
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-        },
-      ],
-    };
+    renderWithProviders(<QueryLogPage />);
+    await waitFor(() => expect(screen.getByLabelText('Colour for 192.168.1.1:80')).toBeInTheDocument());
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
+    fireEvent.change(screen.getByLabelText('Colour for 192.168.1.1:80'), { target: { value: '#ff0000' } });
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
+      const call = (global.fetch as jest.Mock).mock.calls
+        .find(([url]) => String(url).includes('save-connections'));
+      const saved = JSON.parse(call[1].body).connections;
+      // The colour lands on the right record even though the id is ip:port.
+      expect(saved[0]).toMatchObject({ ip: '192.168.1.1', port: 80, color: '#ff0000' });
+      expect(saved[1].color).toBeUndefined();
     });
-
-    // Should handle combined mode
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles search functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-        },
-        {
-          question: { name: 'google.com' },
-          client: '192.168.1.101',
-          time: '2024-01-01T00:01:00Z',
-          status: 'processed',
-          reason: 'FilteredBlackList',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render search input
-    const searchInput = screen.getByPlaceholderText('Search domain or client...');
-    expect(searchInput).toBeInTheDocument();
-
-    // Test search functionality
-    fireEvent.change(searchInput, { target: { value: 'example' } });
-    expect(searchInput).toHaveValue('example');
-  });
-
-  it('handles filter status changes', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: [] }),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render filter buttons - use getAllByText and check the button specifically
-    const filterButtons = screen.getAllByText('Processed');
-    expect(filterButtons.length).toBeGreaterThan(0);
-    expect(screen.getByText('All')).toBeInTheDocument();
-    expect(screen.getByText('Filtered')).toBeInTheDocument();
-  });
-
-  it('handles block/unblock actions', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'blocked-site.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'FilteredBlackList',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render block/unblock buttons
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles color picker functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-          serverIp: '192.168.1.1:8080',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle color functionality
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles infinite scroll functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: Array.from({ length: 30 }, (_, i) => ({
-        question: { name: `example${i}.com` },
-        client: '192.168.1.100',
-        time: '2024-01-01T00:00:00Z',
-        status: 'processed',
-        reason: 'NotFilteredNotFound',
-      })),
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle large datasets
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles polling functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle polling
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles URL-based connections', async () => {
-    const mockConnections = [
-      { url: 'https://adguard.example.com', port: 443, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockLogs = {
-      data: [
-        {
-          question: { name: 'example.com' },
-          client: '192.168.1.100',
-          time: '2024-01-01T00:00:00Z',
-          status: 'processed',
-          reason: 'NotFilteredNotFound',
-        },
-      ],
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockLogs),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle URL connections
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('handles decryption errors in combined mode', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'corrupted' },
-    ];
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: [] }),
-      });
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle decryption errors
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
-  });
-
-  it('shows loading state during data fetch', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce(new Promise(resolve => setTimeout(resolve, 100))); // Delay response
-
-    await act(async () => {
-      render(<QueryLogPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle loading states
-    expect(screen.getByText('Query Log')).toBeInTheDocument();
   });
 });

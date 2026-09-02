@@ -1,129 +1,119 @@
 import { POST } from '../route';
+import { readMigratedStore, writeStore, getPublicStore } from '@/lib/serverConnections';
+import { decryptPassword, isEncrypted } from '@/lib/crypto';
 
-// Mock fs and path
-jest.mock('fs', () => ({
-  promises: {
-    stat: jest.fn(),
-    mkdir: jest.fn(),
-    writeFile: jest.fn(),
-  },
+jest.mock('@/lib/serverConnections', () => ({
+  ...jest.requireActual('@/lib/serverConnections'),
+  readMigratedStore: jest.fn(),
+  writeStore: jest.fn(),
+  getPublicStore: jest.fn(),
 }));
-jest.mock('path', () => ({
-  join: jest.fn(),
-  dirname: jest.fn(),
+jest.mock('../../logger', () => ({
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-const mockFs = require('fs').promises;
-const mockPath = require('path');
+const mockRead = readMigratedStore as jest.MockedFunction<typeof readMigratedStore>;
+const mockWrite = writeStore as jest.MockedFunction<typeof writeStore>;
+const mockPublic = getPublicStore as jest.MockedFunction<typeof getPublicStore>;
 
-// Mock process.cwd
-Object.defineProperty(process, 'cwd', {
-  value: jest.fn(() => '/mock/cwd'),
-  writable: true,
-});
+const request = (body: unknown) => ({ json: async () => body }) as never;
 
-mockPath.join.mockImplementation((...args: string[]) => {
-  if (args[0] === '/mock/cwd' && args[1] === '.data' && args[2] === 'connections.json') {
-    return '/mock/cwd/.data/connections.json';
-  }
-  return args.join('/');
-});
-mockPath.dirname.mockImplementation((path: string) => {
-  if (path === '/mock/cwd/.data/connections.json') {
-    return '/mock/cwd/.data';
-  }
-  return path.split('/').slice(0, -1).join('/');
-});
-
-describe('/api/save-connections', () => {
+describe('POST /api/save-connections', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockPath.join.mockReturnValue('/mock/path/connections.json');
-    mockPath.dirname.mockReturnValue('/mock/path');
+    mockRead.mockResolvedValue({ connections: [], masterServerIp: null });
+    mockPublic.mockResolvedValue({ connections: [], masterServerIp: null });
   });
 
-  it('should save connections data successfully', async () => {
-    const mockData = { connections: [{ ip: '192.168.1.1' }], masterServerIp: '192.168.1.100' };
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue(mockData),
-    } as unknown as Request;
-
-    mockFs.stat.mockResolvedValue({} as any); // Directory exists
-    mockFs.writeFile.mockResolvedValue(undefined);
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
+  it('encrypts a new plaintext password before writing it', async () => {
+    const response = await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'admin', password: 'super-secret' }],
+      masterServerIp: null,
+    }));
 
     expect(response.status).toBe(200);
-    expect(result.message).toBe('Connections saved successfully.');
-    expect(mockFs.writeFile).toHaveBeenCalled();
+    const written = mockWrite.mock.calls[0][0];
+    expect(written.connections[0].password).not.toBe('super-secret');
+    expect(isEncrypted(written.connections[0].password)).toBe(true);
+    expect(decryptPassword(written.connections[0].password)).toBe('super-secret');
   });
 
-  it('should create directory if it does not exist', async () => {
-    const mockData = { connections: [], masterServerIp: null };
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue(mockData),
-    } as unknown as Request;
+  it('keeps the stored ciphertext when no password is supplied', async () => {
+    mockRead.mockResolvedValue({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'admin', password: 'v2:existing-cipher' }],
+      masterServerIp: null,
+    });
 
-    const error = new Error('Directory not found') as NodeJS.ErrnoException;
-    error.code = 'ENOENT';
-    mockFs.stat.mockRejectedValueOnce(error); // Directory doesn't exist
-    mockFs.mkdir.mockResolvedValue(undefined);
-    mockFs.writeFile.mockResolvedValue(undefined);
+    await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'renamed', color: '#fff' }],
+      masterServerIp: null,
+    }));
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(result.message).toBe('Connections saved successfully.');
-    expect(mockFs.mkdir).toHaveBeenCalledWith('/mock/path', { recursive: true });
+    const written = mockWrite.mock.calls[0][0];
+    expect(written.connections[0].password).toBe('v2:existing-cipher');
+    expect(written.connections[0].username).toBe('renamed');
   });
 
-  it('should return error when JSON parsing fails', async () => {
-    const mockRequest = {
-      json: jest.fn().mockRejectedValue(new Error('Invalid JSON')),
-    } as unknown as Request;
+  it('rejects a new connection without a password', async () => {
+    const response = await POST(request({
+      connections: [{ ip: '10.0.0.9', port: 80, username: 'admin' }],
+      masterServerIp: null,
+    }));
 
-    const response = await POST(mockRequest);
-    const result = await response.json();
+    expect(response.status).toBe(400);
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a connection with neither ip nor url', async () => {
+    const response = await POST(request({ connections: [{ username: 'admin', password: 'x' }] }));
+    expect(response.status).toBe(400);
+  });
+
+  it('rejects a non-http scheme', async () => {
+    const response = await POST(request({
+      connections: [{ url: 'file:///etc/passwd', username: 'admin', password: 'x' }],
+    }));
+    expect(response.status).toBe(400);
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a payload that is not an array of connections', async () => {
+    expect((await POST(request({ connections: 'everything' }))).status).toBe(400);
+  });
+
+  it('rejects an out-of-range port', async () => {
+    const response = await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 999999, username: 'admin', password: 'x' }],
+    }));
+    expect(response.status).toBe(400);
+  });
+
+  it('drops a master id that matches no connection', async () => {
+    await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'admin', password: 'x' }],
+      masterServerIp: 'somewhere.else',
+    }));
+
+    expect(mockWrite.mock.calls[0][0].masterServerIp).toBeNull();
+  });
+
+  it('keeps a master id that matches a connection', async () => {
+    await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'admin', password: 'x' }],
+      masterServerIp: '10.0.0.1:80',
+    }));
+
+    expect(mockWrite.mock.calls[0][0].masterServerIp).toBe('10.0.0.1:80');
+  });
+
+  it('returns 500 when the write fails', async () => {
+    mockWrite.mockRejectedValue(new Error('read-only filesystem'));
+
+    const response = await POST(request({
+      connections: [{ ip: '10.0.0.1', port: 80, username: 'admin', password: 'x' }],
+    }));
 
     expect(response.status).toBe(500);
-    expect(result.message).toBe('Failed to save connections.');
-    expect(result.error).toBe('Invalid JSON');
-  });
-
-  it('should return error when writeFile fails', async () => {
-    const mockData = { connections: [{ ip: '192.168.1.1' }] };
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue(mockData),
-    } as unknown as Request;
-
-    mockFs.stat.mockResolvedValue({} as any);
-    mockFs.writeFile.mockRejectedValue(new Error('Write failed'));
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(500);
-    expect(result.message).toBe('Failed to save connections.');
-    expect(result.error).toBe('Write failed');
-  });
-
-  it('should return error when directory creation fails with non-ENOENT error', async () => {
-    const mockData = { connections: [] };
-    const mockRequest = {
-      json: jest.fn().mockResolvedValue(mockData),
-    } as unknown as Request;
-
-    const error = new Error('Permission denied') as NodeJS.ErrnoException;
-    error.code = 'EACCES';
-    mockFs.stat.mockRejectedValue(error);
-
-    const response = await POST(mockRequest);
-    const result = await response.json();
-
-    expect(response.status).toBe(500);
-    expect(result.message).toBe('Failed to save connections.');
-    expect(result.error).toBe('Permission denied');
   });
 });

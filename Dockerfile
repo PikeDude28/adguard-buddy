@@ -1,34 +1,38 @@
-# Use official Node.js LTS image for AMD64
-FROM node:20-bullseye AS builder
+# syntax=docker/dockerfile:1
 
+FROM node:20-bookworm-slim AS deps
 WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 
+FROM node:20-bookworm-slim AS builder
+WORKDIR /app
+RUN corepack enable
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
-
-# Install dependencies with pnpm und baue native Module
-RUN pnpm install --frozen-lockfile && pnpm rebuild
-# Run linting before build, fail on warnings
-RUN pnpm lint
-
-# Build Next.js app
+RUN pnpm lint && pnpm type-check
 RUN pnpm build
 
-
-# Production image
-FROM node:20-bullseye
-
+FROM node:20-bookworm-slim AS runner
 WORKDIR /app
 
-COPY --from=builder /app ./
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
 
-# Install pnpm in production image
-RUN npm install -g pnpm@8
+# Next's standalone output ships only the server and the modules it actually
+# imports - no sources, no devDependencies, no package manager.
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/docs ./docs
+COPY --from=builder /app/pics ./pics
 
+# Runtime state: connections, auto-sync config and logs.
+RUN mkdir -p /app/.data /app/logs && chown -R node:node /app/.data /app/logs
+VOLUME ["/app/.data", "/app/logs"]
 
-# Set image labels for metadata
 ARG BUILD_DATE
 ARG VCS_REF
 ARG VERSION
@@ -37,8 +41,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
 	org.opencontainers.image.source="https://github.com/chrizzo84/adguard-buddy" \
 	org.opencontainers.image.version="${VERSION}"
 
-ENV NODE_ENV=production
-
+USER node
 EXPOSE 3000
 
-CMD ["pnpm", "start"]
+CMD ["node", "server.js"]

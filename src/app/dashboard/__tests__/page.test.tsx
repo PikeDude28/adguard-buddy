@@ -1,537 +1,169 @@
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { screen, waitFor, fireEvent } from '@testing-library/react';
 import Dashboard from '../page';
-import CryptoJS from 'crypto-js';
+import { useConnections } from '../../contexts/ConnectionsContext';
+import { connection, mockConnectionsValue, renderWithProviders } from '../../../test-utils';
 
-// Mock dependencies
-jest.mock('@/app/components/NavMenu', () => ({
-  __esModule: true,
-  default: () => <nav data-testid="nav-menu">Navigation</nav>,
+jest.mock('../../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
 }));
 
-// Mock crypto-js
-jest.mock('crypto-js', () => ({
-  AES: {
-    encrypt: jest.fn(() => 'encrypted-password'),
-    decrypt: jest.fn(() => ({
-      toString: jest.fn(() => 'decrypted-password'),
-    })),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
-}));
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
-// Mock fetch
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
+const STATUS = {
+  version: 'v0.107.52',
+  language: 'en',
+  dns_port: 53,
+  http_port: 3000,
+  running: true,
+  protection_enabled: true,
+  dhcp_available: false,
+  dns_addresses: ['192.168.1.1'],
+};
+
+const STATS = {
+  num_dns_queries: 1000,
+  num_blocked_filtering: 250,
+  avg_processing_time: 0.02,
+  dns_queries: [10, 20, 30, 40],
+};
+
+function mockCheckResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      status: 'connected',
+      response: JSON.stringify(STATUS),
+      code: 200,
+      stats: STATS,
+      ...overrides,
+    }),
+  } as unknown as Response;
+}
 
 describe('Dashboard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch.mockClear();
+    mockUseConnections.mockReturnValue(mockConnectionsValue());
+    global.fetch = jest.fn().mockResolvedValue(mockCheckResponse());
   });
 
-  it('renders the dashboard with navigation', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('addresses servers by connection id and never sends credentials', async () => {
+    renderWithProviders(<Dashboard />);
 
-    await act(async () => {
-      render(<Dashboard />);
-    });
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
 
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
+    const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ connectionId: '192.168.1.1:80' });
+    expect(init.body).not.toContain('password');
   });
 
-  it('fetches connections on mount', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('summarises the fleet in the KPI row', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
+    renderWithProviders(<Dashboard />);
 
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
+    await waitFor(() => expect(screen.getByText('2/2')).toBeInTheDocument());
+    expect(screen.getByText('2,000')).toBeInTheDocument(); // queries across both
+    expect(screen.getByText('500')).toBeInTheDocument();   // blocked across both
+    expect(screen.getByText('25.0%')).toBeInTheDocument();
   });
 
-  it('displays loading state initially', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('renders one row per server with its figures', async () => {
+    renderWithProviders(<Dashboard />);
 
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    // Should show loading state initially
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Connected')).toBeInTheDocument());
+    expect(screen.getByText('192.168.1.1:80')).toBeInTheDocument();
+    expect(screen.getByText('admin')).toBeInTheDocument();
+    expect(screen.getByText('Active')).toBeInTheDocument();
   });
 
-  it('handles fetch connections error gracefully', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should still render the page even with fetch error
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('renders connection cards when connections exist', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should render connection information
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('shows no connections message when empty', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle empty connections gracefully
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('handles protection toggle API calls', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en", "protection_enabled": true}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Wait for the component to render the toggle button
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // The component should be rendered and functional
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('displays error messages when API calls fail', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        json: () => Promise.resolve({ message: 'API Error' }),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle API errors gracefully
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('renders AdGuard status card with parsed data', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: JSON.stringify({
-        version: 'v0.107.29',
-        language: 'en',
-        dns_port: 53,
-        http_port: 80,
-        protection_enabled: true,
-        dhcp_available: false,
-        running: true,
-        dns_addresses: ['8.8.8.8', '1.1.1.1']
-      }),
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // Should render status information
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('renders AdGuard stats card with statistics', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1500,
-        num_blocked_filtering: 200,
-        num_replaced_safebrowsing: 5,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 10,
-        avg_processing_time: 0.002
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // Should render statistics
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('handles toggle all protection functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en", "protection_enabled": true}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({}),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // Should handle bulk operations
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('handles connection with URL instead of IP', async () => {
-    const mockConnections = [
-      { url: 'https://adguard.example.com', port: 443, username: 'admin', password: 'encrypted' },
-    ];
-
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // Should handle URL-based connections
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-  });
-
-  it('handles decryption errors gracefully', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'corrupted' },
-    ];
-
-    // Mock decryption failure
-    const originalDecrypt = CryptoJS.AES.decrypt;
-    CryptoJS.AES.decrypt = jest.fn(() => ({
-      toString: jest.fn(() => { throw new Error('Decryption failed'); }),
+  it('warns when a server has protection disabled', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(mockCheckResponse({
+      response: JSON.stringify({ ...STATUS, protection_enabled: false }),
     }));
 
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({
-          status: 'error',
-          response: 'Connection failed',
-          stats: null
-        }),
-      });
+    renderWithProviders(<Dashboard />);
 
-    await act(async () => {
-      render(<Dashboard />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    });
-
-    // Restore original function
-    CryptoJS.AES.decrypt = originalDecrypt;
-
-    // Should handle decryption errors
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Protection is off')).toBeInTheDocument());
   });
 
-  it('shows refresh button and handles refresh functionality', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('toggles protection for a single server by id', async () => {
+    renderWithProviders(<Dashboard />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument());
 
-    const mockCheckResponse = {
-      status: 'success',
-      response: '{"version": "v0.107.29", "language": "en"}',
-      stats: {
-        num_dns_queries: 1000,
-        num_blocked_filtering: 100,
-        num_replaced_safebrowsing: 0,
-        num_replaced_safesearch: 0,
-        num_replaced_parental: 0,
-        avg_processing_time: 0.001
-      }
-    };
-
-    mockFetch
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ connections: mockConnections }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve(mockCheckResponse),
-      });
-
-    await act(async () => {
-      render(<Dashboard />);
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Disable' }));
 
     await waitFor(() => {
-      expect(screen.getByText('Dashboard')).toBeInTheDocument();
+      const call = (global.fetch as jest.Mock).mock.calls
+        .find(([url]) => String(url).includes('/api/adguard-control'));
+      expect(JSON.parse(call[1].body)).toEqual({
+        connectionId: '192.168.1.1:80',
+        protection_enabled: false,
+      });
     });
+  });
 
-    // Should have refresh functionality
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
+  it('toggles every server when Disable all is used', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+    }));
+    renderWithProviders(<Dashboard />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Disable all/ })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: /Disable all/ }));
+
+    await waitFor(() => {
+      const controlCalls = (global.fetch as jest.Mock).mock.calls
+        .filter(([url]) => String(url).includes('/api/adguard-control'));
+      expect(controlCalls).toHaveLength(2);
+    });
+  });
+
+  it('expands a row to show version and ports', async () => {
+    renderWithProviders(<Dashboard />);
+    await waitFor(() => expect(screen.getByLabelText('Expand 192.168.1.1:80')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Expand 192.168.1.1:80'));
+
+    expect(screen.getByText('v0.107.52')).toBeInTheDocument();
+    expect(screen.getByText('53')).toBeInTheDocument();
+    expect(screen.getByText('192.168.1.1')).toBeInTheDocument();
+  });
+
+  it('marks an unreachable server as an error and shows the message', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: false,
+      status: 502,
+      json: async () => ({ message: 'Failed to reach AdGuard Home' }),
+    } as unknown as Response);
+
+    renderWithProviders(<Dashboard />);
+
+    await waitFor(() => expect(screen.getByText('Error')).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText('Expand 192.168.1.1:80'));
+    expect(screen.getByText('Failed to reach AdGuard Home')).toBeInTheDocument();
+  });
+
+  it('shows an empty state when nothing is configured', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [], selectedId: null, selected: null,
+    }));
+
+    renderWithProviders(<Dashboard />);
+
+    await waitFor(() => expect(screen.getByText('No connections configured')).toBeInTheDocument());
+  });
+
+  it('refetches on demand', async () => {
+    renderWithProviders(<Dashboard />);
+    // The refresh button stays disabled until the first load settles.
+    await waitFor(() => expect(screen.getByRole('button', { name: /Refresh/ })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole('button', { name: /Refresh/ }));
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(2));
   });
 });

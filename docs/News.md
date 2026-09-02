@@ -1,5 +1,43 @@
 # ✨ What's New in AdGuard Buddy ✨
 
+**September 2, 2026 - Redesign & credential hardening**
+
+## 🔐 Credentials never reach the browser
+
+**This is a breaking configuration change - please read.**
+
+- **Server-side only** - Passwords are decrypted inside API routes. Pages now address a server by its connection id and never send credentials over the wire.
+- **New key variable** - Use `ADGUARD_BUDDY_ENCRYPTION_KEY`. The old `NEXT_PUBLIC_` name shipped the key inside the browser bundle, so treat any key stored under it as public and rotate your AdGuard Home passwords.
+- **Stronger encryption** - New passwords use AES-256-GCM with a scrypt-derived key. Existing entries are re-encrypted automatically on first read.
+- **Optional login** - Set `ADGUARD_BUDDY_AUTH_USER` and `ADGUARD_BUDDY_AUTH_PASSWORD` to require HTTP Basic auth for the whole app.
+- **Debug endpoint removed** - `/api/test-decrypt` exposed connection ids, usernames and key hints without authentication. It is gone.
+
+## 🎨 Redesigned interface
+
+- **Sidebar navigation** - Replaces the top bar and its duplicated mobile row.
+- **One global server scope** - Pick Single or All once in the header; every page follows it.
+- **Fleet dashboard** - Aggregate KPIs plus a compact server table with status, protection toggle and a 24h sparkline, so ten servers fit on one screen.
+- **Real charts** - Queries per hour now has a value axis, gridlines, a hover readout and time labels derived from the data. When a server reports no history you get an empty state instead of invented numbers.
+- **Consistent status language** - One badge component everywhere; no more mixed pills and emoji.
+- **Accessibility** - Labelled inputs, dialogs with Escape and focus trapping, and skeletons that match the final layout.
+
+## 🐛 Fixes
+
+- **Combined statistics** - A typo in the encryption key variable made combined stats fall back to the default key, so anyone with a custom key got 401s.
+- **Server colours** - Colours were matched on the bare IP and silently never saved for URL or `ip:port` servers.
+- **Block/unblock** - Now asks for confirmation and states plainly that the rule is written to every configured server; failures are reported instead of ignored.
+- **Request timeouts** - Outgoing calls have a 15s timeout, so an unreachable server no longer hangs a page.
+- **Auto-sync keys** - The scheduler no longer tries a list of keys including the built-in default, which quietly defeated a custom key.
+
+## 📦 Packaging
+
+- **Smaller image** - Multi-stage build on Next's standalone output, running as a non-root user.
+- **Persistent config** - `/app/.data` and `/app/logs` are declared volumes; mount them or your connections are lost when the container is recreated.
+
+---
+
+# ✨ What's New in AdGuard Buddy ✨
+
 **January 8, 2026 - v0.1.20260108**
 
 ## 📊 Statistics Improvements

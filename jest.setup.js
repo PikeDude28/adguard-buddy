@@ -26,6 +26,14 @@ beforeAll(() => {
     if (message.includes('Failed to check for news')) {
       return; // Suppress expected news fetching errors in tests
     }
+    if (message.includes('Not implemented: HTMLFormElement.prototype.requestSubmit')) {
+      return; // jsdom limitation, irrelevant to these tests
+    }
+    if (message.includes('not wrapped in act(')) {
+      // Background polling in the pages settles after the assertion; the
+      // warning is noise rather than a signal here.
+      return;
+    }
     // For all other errors, use the original console.error
     originalConsoleError.apply(console, args);
   });
@@ -35,6 +43,9 @@ beforeAll(() => {
     const message = args.join(' ');
     if (message.includes('expected warning')) {
       return;
+    }
+    if (message.includes('[adguard-buddy]')) {
+      return; // Expected configuration warnings (encryption key fallbacks)
     }
     originalConsoleWarn.apply(console, args);
   });
@@ -82,18 +93,43 @@ jest.mock('next/server', () => {
   };
 });
 
+// jsdom does not implement scrolling.
+window.scrollTo = jest.fn();
+Element.prototype.scrollIntoView = jest.fn();
+
 // Polyfills for Web APIs
+//
+// The stream polyfill records everything the route enqueues so tests can assert
+// on streamed SSE output via `await response.body.text()`.
 global.ReadableStream = class ReadableStream {
   constructor(options) {
     this.options = options;
-    // Execute the start method immediately for testing
-    if (options && options.start) {
-      const mockController = {
-        enqueue: jest.fn(),
-        close: jest.fn(),
-      };
-      options.start(mockController);
-    }
+    this.chunks = [];
+    this.closed = false;
+
+    const controller = {
+      enqueue: (chunk) => { this.chunks.push(chunk); },
+      close: () => { this.closed = true; },
+    };
+    this.controller = controller;
+    this.started = options && options.start
+      ? Promise.resolve(options.start(controller))
+      : Promise.resolve();
+  }
+
+  /** Awaits the producer and returns everything it wrote, decoded. */
+  async text() {
+    await this.started;
+    return this.chunks.map((chunk) => Buffer.from(chunk).toString('utf-8')).join('');
+  }
+
+  /** SSE frames as parsed message objects. */
+  async events() {
+    const raw = await this.text();
+    return raw
+      .split('\n\n')
+      .filter((frame) => frame.startsWith('data: '))
+      .map((frame) => JSON.parse(frame.slice(6)));
   }
 };
 

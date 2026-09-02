@@ -1,452 +1,212 @@
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import SyncStatusPage from '../page';
+import { useConnections } from '../../contexts/ConnectionsContext';
+import { connection, mockConnectionsValue, renderWithProviders } from '../../../test-utils';
 
-// Mock dependencies
-jest.mock('@/app/components/NavMenu', () => ({
-  __esModule: true,
-  default: () => <nav data-testid="nav-menu">Navigation</nav>,
+jest.mock('../../contexts/ConnectionsContext', () => ({
+  ...jest.requireActual('../../contexts/ConnectionsContext'),
+  useConnections: jest.fn(),
 }));
 
-// Mock crypto-js
-jest.mock('crypto-js', () => ({
-  AES: {
-    encrypt: jest.fn(() => 'encrypted-password'),
-    decrypt: jest.fn(() => ({
-      toString: jest.fn(() => 'decrypted-password'),
-    })),
-  },
-  enc: {
-    Utf8: 'utf8',
-  },
-}));
+const mockUseConnections = useConnections as jest.MockedFunction<typeof useConnections>;
 
-// Mock fetch
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
+const MASTER_SETTINGS = {
+  filtering: {
+    enabled: true,
+    interval: 24,
+    user_rules: ['||ads.test^'],
+    filters: [{ url: 'https://a.test/l.txt', name: 'List A', enabled: true }],
+    whitelist_filters: [],
+  },
+  rewrites: [],
+};
 
-// Helper function to mock auto-sync config response
-const mockAutoSyncConfigResponse = () => ({
-  ok: true,
-  json: () => Promise.resolve({
-    config: {
-      enabled: false,
-      interval: '0 */6 * * *',
-      categories: [],
-      paused: false
-    },
-    isRunning: false,
-    isPaused: false,
-    nextSync: null,
-    recentLogs: []
-  }),
+const DRIFTED_SETTINGS = {
+  filtering: {
+    enabled: false,
+    interval: 24,
+    user_rules: [],
+    filters: [],
+    whitelist_filters: [],
+  },
+  rewrites: [],
+};
+
+const AUTO_SYNC = {
+  config: { enabled: true, interval: '1hour', categories: ['filtering'], lastSync: 1_700_000_000_000 },
+  isRunning: false,
+  isPaused: false,
+  nextSync: null,
+  recentLogs: [
+    { timestamp: 1_700_000_000_000, replicaId: '10.0.0.2:80', category: 'filtering', status: 'success', message: 'ok', duration: 120 },
+    { timestamp: 1_700_000_100_000, replicaId: '10.0.0.2:80', category: 'rewrites', status: 'error', message: 'boom' },
+  ],
+};
+
+const TWO_SERVERS = mockConnectionsValue({
+  connections: [connection(), connection({ id: '10.0.0.2:80', ip: '10.0.0.2' })],
+  masterServerId: '192.168.1.1:80',
 });
 
-// Mock scrollIntoView
-Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
-  writable: true,
-  value: jest.fn(),
-});
+function mockFetch(replicaSettings: unknown = DRIFTED_SETTINGS) {
+  return jest.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes('auto-sync-config')) {
+      return { ok: true, status: 200, json: async () => AUTO_SYNC } as unknown as Response;
+    }
+    if (String(url).includes('get-all-settings')) {
+      const { connectionId } = JSON.parse(init!.body as string);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          settings: connectionId === '192.168.1.1:80' ? MASTER_SETTINGS : replicaSettings,
+          errors: {},
+        }),
+      } as unknown as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
+  });
+}
 
 describe('SyncStatusPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch.mockClear();
+    mockUseConnections.mockReturnValue(TWO_SERVERS);
+    global.fetch = mockFetch() as unknown as typeof fetch;
+  });
 
-    // Default: Mock /api/auto-sync-config to avoid unhandled fetch errors
-    mockFetch.mockImplementation((url) => {
-      if (url === '/api/auto-sync-config') {
-        return Promise.resolve(mockAutoSyncConfigResponse());
-      }
-      if (url === '/api/get-connections') {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-        });
-      }
-      // Return a rejected promise for unmocked URLs
-      return Promise.reject(new Error(`Unhandled fetch call: ${url}`));
+  it('fetches settings for each server by connection id', async () => {
+    renderWithProviders(<SyncStatusPage />);
+
+    await waitFor(() => {
+      const calls = (global.fetch as jest.Mock).mock.calls
+        .filter(([url]) => String(url).includes('get-all-settings'))
+        .map(([, init]) => JSON.parse(init.body).connectionId);
+      expect(calls).toEqual(expect.arrayContaining(['192.168.1.1:80', '10.0.0.2:80']));
     });
   });
 
-  it('renders the sync status page with navigation', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [] }),
-    });
+  it('reports drift between the master and a replica', async () => {
+    renderWithProviders(<SyncStatusPage />);
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    expect(screen.getByText('Sync Status')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('10.0.0.2:80')).toBeInTheDocument());
+    expect(screen.getByText(/differences/)).toBeInTheDocument();
+    expect(screen.getByText('Filtering')).toBeInTheDocument();
   });
 
-  it('fetches connections on mount', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('marks a matching replica as in sync', async () => {
+    global.fetch = mockFetch(MASTER_SETTINGS) as unknown as typeof fetch;
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections, masterServerIp: '192.168.1.1:8080' }),
-    });
+    renderWithProviders(<SyncStatusPage />);
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
+    // "In sync" is also a KPI label, so assert on the replica card's own copy.
+    await waitFor(() =>
+      expect(screen.getByText('Every syncable category matches the master.')).toBeInTheDocument());
+    expect(screen.getAllByText('In sync').length).toBeGreaterThan(1);
   });
 
-  it('handles fetch connections error gracefully', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
+  it('shows field-level differences when a category is expanded', async () => {
+    renderWithProviders(<SyncStatusPage />);
+    await waitFor(() => expect(screen.getByText('Filtering')).toBeInTheDocument());
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
+    fireEvent.click(screen.getByText('Filtering'));
 
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should still render the page even with fetch error
-    expect(screen.getByText('Sync Status')).toBeInTheDocument();
+    expect(screen.getByText('Filtering enabled')).toBeInTheDocument();
+    expect(screen.getByText('Custom rules')).toBeInTheDocument();
+    expect(screen.getByText('List A')).toBeInTheDocument();
   });
 
-  it('renders sync status interface when connections exist', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-    const mockSettings = { filtering: { enabled: true } };
+  it('syncs a category using master and replica ids', async () => {
+    renderWithProviders(<SyncStatusPage />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Sync' })).toBeInTheDocument());
 
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
-      }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({
-            connections: mockConnections,
-            masterServerIp: '192.168.1.1:8080',
-          }),
-        };
-      }
-      if (url === '/api/get-all-settings') {
-        return {
-          ok: true,
-          json: async () => ({ settings: mockSettings }),
-        };
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
-
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sync' }));
 
     await waitFor(() => {
-      expect(screen.getAllByText('In Sync')[0]).toBeInTheDocument();
+      const call = (global.fetch as jest.Mock).mock.calls.find(([url]) => String(url).includes('sync-category'));
+      expect(JSON.parse(call[1].body)).toEqual({
+        sourceId: '192.168.1.1:80',
+        destinationId: '10.0.0.2:80',
+        category: 'filtering',
+      });
     });
   });
 
-  it('handles single connection scenario', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
+  it('asks for a master server when none is set', async () => {
+    mockUseConnections.mockReturnValue(mockConnectionsValue({
+      connections: [connection()], masterServerId: null,
+    }));
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: mockConnections, masterServerIp: '192.168.1.1:8080' }),
-    });
+    renderWithProviders(<SyncStatusPage />);
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/get-connections');
-    });
-
-    // Should handle single connection gracefully
-    expect(screen.getByText('Sync Status')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No master server selected')).toBeInTheDocument());
   });
 
-  it('handles API errors during sync operations', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
+  it('warns that manual sync is blocked while auto-sync runs', async () => {
+    global.fetch = jest.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('auto-sync-config')) {
+        return { ok: true, status: 200, json: async () => ({ ...AUTO_SYNC, isRunning: true }) } as unknown as Response;
       }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({ connections: mockConnections, masterServerIp: '192.168.1.1:8080' }),
-        };
-      }
-      if (url === '/api/get-all-settings') {
-        const body = await JSON.parse(options.body);
-        if (body.ip === '192.168.1.1') {
-          return {
-            ok: true,
-            json: async () => ({ settings: { filtering: { enabled: true } } })
-          };
-        }
-        return { ok: false, json: async () => ({ message: 'Sync failed' }) };
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
+      return mockFetch()(url, init);
+    }) as unknown as typeof fetch;
 
+    renderWithProviders(<SyncStatusPage />);
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText(/Failed to fetch settings for/i)).toBeInTheDocument();
-    });
+    await waitFor(() => expect(screen.getByText('Auto-sync is active')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Sync' })).toBeDisabled());
   });
 
-  it('fetches and displays master server settings', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-    const mockSettings = { filtering: { enabled: true } };
+  it('shows the auto-sync history with its filters', async () => {
+    renderWithProviders(<SyncStatusPage />);
+    await waitFor(() => expect(screen.getByRole('tab', { name: /Auto-sync history/ })).toBeInTheDocument());
 
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
-      }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({
-            connections: mockConnections,
-            masterServerIp: '192.168.1.1:8080',
-          }),
-        };
-      }
-      if (url === '/api/get-all-settings') {
-        return {
-          ok: true,
-          json: async () => ({ settings: mockSettings }),
-        };
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
+    fireEvent.click(screen.getByRole('tab', { name: /Auto-sync history/ }));
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('192.168.1.1:8080')).toBeInTheDocument();
-    });
-
-    expect(screen.getByText('Comparing all servers against master:')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/Sync history \(2\)/)).toBeInTheDocument());
+    // One of two runs succeeded; the value and its unit are separate elements.
+    const tile = screen.getByText('Success rate').closest('.card') as HTMLElement;
+    expect(tile).toHaveTextContent('50');
+    expect(tile).toHaveTextContent('%');
   });
 
-  it('displays out of sync status when settings differ', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-    const masterSettings = { filtering: { enabled: true } };
-    const replicaSettings = { filtering: { enabled: false } };
+  it('filters the history by status', async () => {
+    renderWithProviders(<SyncStatusPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Auto-sync history/ }));
+    await waitFor(() => expect(screen.getByLabelText('Status')).toBeInTheDocument());
 
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
-      }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({
-            connections: mockConnections,
-            masterServerIp: '192.168.1.1:8080',
-          }),
-        };
-      }
-      if (url === '/api/get-all-settings') {
-        const body = await JSON.parse(options.body);
-        if (body.ip === '192.168.1.1') {
-          return {
-            ok: true,
-            json: async () => ({ settings: masterSettings }),
-          };
-        }
-        if (body.ip === '192.168.1.2') {
-          return {
-            ok: true,
-            json: async () => ({ settings: replicaSettings }),
-          };
-        }
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'error' } });
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Out of Sync')).toBeInTheDocument();
-    });
-
-    expect(screen.getByText('filtering')).toBeInTheDocument();
-    expect(screen.getByText('Sync')).toBeInTheDocument();
+    expect(screen.getByText(/Sync history \(1\)/)).toBeInTheDocument();
+    expect(screen.getByText('boom')).toBeInTheDocument();
   });
 
-  it('displays in sync status when settings match', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-    const mockSettings = {
-      filtering: { enabled: true },
-      querylogConfig: { enabled: false },
-    };
+  it('triggers a manual auto-sync run', async () => {
+    renderWithProviders(<SyncStatusPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Auto-sync history/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Trigger sync/ })).toBeEnabled());
 
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
-      }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({
-            connections: mockConnections,
-            masterServerIp: '192.168.1.1:8080',
-          }),
-        };
-      }
-      if (url === '/api/get-all-settings') {
-        return {
-          ok: true,
-          json: async () => ({ settings: mockSettings }),
-        };
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
+    fireEvent.click(screen.getByRole('button', { name: /Trigger sync/ }));
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getAllByText('In Sync')[0]).toBeInTheDocument();
-    });
+    await waitFor(() => expect((global.fetch as jest.Mock).mock.calls.some(([url]) =>
+      String(url).includes('auto-sync-trigger'))).toBe(true));
   });
 
-  it('handles sync button click', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.1', port: 8080, username: 'admin', password: 'encrypted' },
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-    const masterSettings = { filtering: { enabled: true } };
-    const replicaSettings = { filtering: { enabled: false } };
-
-    mockFetch.mockImplementation(async (url, options) => {
-      if (url === '/api/auto-sync-config') {
-        return mockAutoSyncConfigResponse();
+  it('reports an unreachable replica', async () => {
+    global.fetch = jest.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('auto-sync-config')) {
+        return { ok: true, status: 200, json: async () => AUTO_SYNC } as unknown as Response;
       }
-      if (url === '/api/get-connections') {
-        return {
-          ok: true,
-          json: async () => ({
-            connections: mockConnections,
-            masterServerIp: '192.168.1.1:8080',
-          }),
-        };
+      const { connectionId } = JSON.parse(init!.body as string);
+      if (connectionId === '10.0.0.2:80') {
+        return { ok: false, status: 502, json: async () => ({}) } as unknown as Response;
       }
-      if (url === '/api/get-all-settings') {
-        const body = await JSON.parse(options.body);
-        if (body.ip === '192.168.1.1') {
-          return {
-            ok: true,
-            json: async () => ({ settings: masterSettings }),
-          };
-        }
-        if (body.ip === '192.168.1.2') {
-          return {
-            ok: true,
-            json: async () => ({ settings: replicaSettings }),
-          };
-        }
-      }
-      if (url === '/api/sync-category') {
-        return {
-          ok: true,
-          body: new ReadableStream({
-            start(controller) {
-              controller.close();
-            }
-          })
-        };
-      }
-      throw new Error(`Unhandled fetch call: ${url}`);
-    });
+      return { ok: true, status: 200, json: async () => ({ settings: MASTER_SETTINGS, errors: {} }) } as unknown as Response;
+    }) as unknown as typeof fetch;
 
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
+    renderWithProviders(<SyncStatusPage />);
 
-    let syncButton: HTMLElement;
-    await waitFor(() => {
-      const syncButtons = screen.getAllByText('Sync');
-      syncButton = syncButtons[0];
-      expect(syncButton).toBeInTheDocument();
-    });
-
-    fireEvent.click(syncButton!);
-
-    await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith('/api/sync-category', expect.any(Object));
-    });
-  });
-
-  it('handles master server not configured', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ connections: [], masterServerIp: null }),
-    });
-
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Master server or connections not configured.')).toBeInTheDocument();
-    });
-  });
-
-  it('handles master server not found in connections', async () => {
-    const mockConnections = [
-      { ip: '192.168.1.2', port: 8080, username: 'admin', password: 'encrypted' },
-    ];
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        connections: mockConnections,
-        masterServerIp: '192.168.1.1:8080'
-      }),
-    });
-
-    await act(async () => {
-      render(<SyncStatusPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Configured master server not found.')).toBeInTheDocument();
-    });
+    await waitFor(() => expect(screen.getByText('Unreachable')).toBeInTheDocument());
+    const card = screen.getByText('Unreachable').closest('div.card') as HTMLElement;
+    expect(within(card).getByText(/Failed to fetch settings for 10.0.0.2:80/)).toBeInTheDocument();
   });
 });

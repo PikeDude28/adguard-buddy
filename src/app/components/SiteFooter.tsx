@@ -13,45 +13,42 @@ export function SiteFooter() {
   }
 
   return (
-    <footer className="border-t border-[#2A2D35] mt-auto">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        <div className="flex flex-col sm:flex-row justify-between items-center text-xs text-gray-500 gap-4">
-          {/* Left side */}
-          <div className="flex items-center gap-4">
-            <span>© {year} chrizzo84</span>
-            <Link
-              href="https://github.com/chrizzo84"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 hover:text-[var(--primary)] transition-colors"
-              aria-label="GitHub Profile chrizzo84"
-            >
-              <Github className="h-4 w-4" aria-hidden="true" />
-              <span>Profile</span>
-            </Link>
-            <Link
-              href="https://github.com/chrizzo84/adguard-buddy"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 hover:text-[var(--primary)] transition-colors"
-              aria-label="Repository adguard-buddy"
-            >
-              <Github className="h-4 w-4" aria-hidden="true" />
-              <span>Repo</span>
-            </Link>
-          </div>
+    <footer className="border-t border-[var(--border)] px-4 py-4 md:px-6">
+      <div className="mx-auto flex w-full max-w-[1400px] flex-col items-center justify-between gap-3 text-[12px] text-[var(--text-subtle)] sm:flex-row">
+        <div className="flex items-center gap-4">
+          <span>© {year} chrizzo84</span>
+          <Link
+            href="https://github.com/chrizzo84"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 transition-colors hover:text-[var(--text)]"
+            aria-label="GitHub Profile chrizzo84"
+          >
+            <Github className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Profile</span>
+          </Link>
+          <Link
+            href="https://github.com/chrizzo84/adguard-buddy"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 transition-colors hover:text-[var(--text)]"
+            aria-label="Repository adguard-buddy"
+          >
+            <Github className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Repo</span>
+          </Link>
+        </div>
 
-          {/* Right side */}
-          <div className="flex items-center gap-4">
-            <span className="font-mono">v{process.env.NEXT_PUBLIC_APP_VERSION}</span>
-            <button
-              onClick={openNews}
-              className="hover:text-[var(--primary)] transition-colors underline"
-              aria-label="Open What's New"
-            >
-              What&apos;s New
-            </button>
-          </div>
+        <div className="flex items-center gap-4">
+          <span className="font-mono">v{process.env.NEXT_PUBLIC_APP_VERSION}</span>
+          <button
+            type="button"
+            onClick={openNews}
+            className="transition-colors hover:text-[var(--text)]"
+            aria-label="Open What's New"
+          >
+            What&apos;s New
+          </button>
         </div>
       </div>
     </footer>

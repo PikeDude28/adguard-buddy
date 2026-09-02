@@ -1,53 +1,59 @@
 import { NextRequest, NextResponse } from "next/server";
 import logger from "../logger";
-import { httpRequest } from '../../lib/httpRequest';
+import { httpRequest } from "@/lib/httpRequest";
+import { authHeaders, buildBaseUrl } from "@/lib/serverConnections";
+import { connectionFromBody, errorResponse } from "@/lib/apiConnection";
 import { normalizeRewrites } from '../rewriteUtils';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const ENDPOINTS: Record<string, string> = {
+  status: `/control/status`,
+  profile: `/control/profile`,
+  dnsSettings: `/control/dns_info`,
+  filtering: `/control/filtering/status`,
+  safebrowsing: `/control/safebrowsing/status`,
+  parental: `/control/parental/status`,
+  safesearch: `/control/safesearch/status`,
+  accessList: `/control/access/list`,
+  blockedServices: `/control/blocked_services/get`,
+  rewrites: `/control/rewrite/list`,
+  tls: `/control/tls/status`,
+  querylogConfig: `/control/querylog/config`,
+  statsConfig: `/control/stats/config`,
+};
+
+/**
+ * Collects every settings endpoint for one stored connection.
+ * Body: { connectionId: string }
+ */
 export async function POST(req: NextRequest) {
-    const { ip, url: connUrl, port = 80, username, password, allowInsecure = false } = await req.json();
-    logger.info(`POST /get-all-settings called for target: ${connUrl || ip}`);
+  try {
+    const { connection, error } = await connectionFromBody(await req.json());
+    if (error) return error;
 
-    const headers: Record<string, string> = {};
-    if (username && password) {
-      headers["Authorization"] =
-        "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
-    }
-    headers["User-Agent"] = "curl/8.0.1";
-    headers["Accept"] = "*/*";
-    headers["Connection"] = "close";
+    const base = buildBaseUrl(connection);
+    logger.info(`POST /get-all-settings called for target: ${base}`);
 
-    // Alle Endpunkte seriell abfragen
-    const endpoints: Record<string, string> = {
-      status: `/control/status`,
-      profile: `/control/profile`,
-      dnsSettings: `/control/dns_info`,
-      filtering: `/control/filtering/status`,
-      safebrowsing: `/control/safebrowsing/status`,
-      parental: `/control/parental/status`,
-      safesearch: `/control/safesearch/status`,
-      accessList: `/control/access/list`,
-      blockedServices: `/control/blocked_services/get`,
-      rewrites: `/control/rewrite/list`,
-      tls: `/control/tls/status`,
-      querylogConfig: `/control/querylog/config`,
-      statsConfig: `/control/stats/config`,
-    };
+    const headers = authHeaders(connection, {
+      "User-Agent": "curl/8.0.1",
+      "Accept": "*/*",
+      "Connection": "close",
+    });
 
     const results: Record<string, unknown> = {};
     const errors: Record<string, string> = {};
 
-    // Build base: prefer provided URL, otherwise ip:port
-    const base = connUrl && connUrl.length > 0 ? connUrl.replace(/\/$/, '') : `http://${ip}:${port}`;
-
-    for (const [key, endpoint] of Object.entries(endpoints)) {
+    // Queried in parallel: a full settings sweep against several servers is the
+    // slowest thing the sync view does, and these endpoints are independent.
+    await Promise.all(Object.entries(ENDPOINTS).map(async ([key, endpoint]) => {
       const fullUrl = `${base}${endpoint}`;
       try {
-        const r = await httpRequest({ method: 'GET', url: fullUrl, headers, allowInsecure });
-        logger.info(`[DEBUG] Endpoint '${key}' status: ${r.statusCode}, response length: ${String(r.body).length}`);
+        const r = await httpRequest({ method: 'GET', url: fullUrl, headers, allowInsecure: connection.allowInsecure });
         if (r.statusCode >= 200 && r.statusCode < 300) {
           try {
             let data = JSON.parse(r.body || '{}');
-            // Normalize rewrites by removing 'enabled' field which may be present in newer AdGuard versions
             if (key === 'rewrites' && Array.isArray(data)) {
               data = normalizeRewrites(data);
             }
@@ -58,10 +64,14 @@ export async function POST(req: NextRequest) {
         } else {
           errors[key] = `Failed with status ${r.statusCode}`;
         }
-      } catch (error) {
-        errors[key] = error instanceof Error ? error.message : String(error);
+      } catch (err) {
+        errors[key] = err instanceof Error ? err.message : String(err);
       }
-    }
+    }));
 
     return NextResponse.json({ settings: results, errors });
+  } catch (error) {
+    logger.error(`Internal server error in /get-all-settings: ${error instanceof Error ? error.message : String(error)}`);
+    return errorResponse(error, 'Internal server error');
+  }
 }

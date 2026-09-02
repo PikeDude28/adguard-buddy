@@ -1,15 +1,23 @@
 import { NextRequest } from "next/server";
 import logger from "../logger";
 import { performCategorySync } from "./sync-logic";
+import { resolveConnection } from "@/lib/serverConnections";
+import { asObject, requireEnum, requireString, ValidationError } from "@/lib/validation";
 
-// Helper to create a streamable response
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+export const SYNC_CATEGORIES = [
+    'filtering', 'querylogConfig', 'statsConfig', 'dnsSettings',
+    'rewrites', 'blockedServices', 'accessList',
+] as const;
+
 const createStreamingResponse = (
     cb: (log: (message: string) => void) => Promise<void>
 ) => {
     const stream = new ReadableStream({
         async start(controller) {
             const encoder = new TextEncoder();
-            // Unified log function: logs to Winston and to stream
             const log = (message: string, level: 'info' | 'warn' | 'error' = 'info') => {
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ message })}\n\n`));
                 if (level === 'info') logger.info(message);
@@ -26,7 +34,6 @@ const createStreamingResponse = (
                 const message = e instanceof Error ? e.message : String(e);
                 log(`SYNC ERROR: ${message}`, 'error');
                 log(`ERROR: ${message}`, 'error');
-                console.error("Stream Error:", e);
             } finally {
                 controller.close();
             }
@@ -42,34 +49,49 @@ const createStreamingResponse = (
     });
 };
 
-export async function POST(req: NextRequest) {
-    try {
-        const {
-            sourceConnection,
-            destinationConnection,
-            category
-        } = await req.json();
+const jsonError = (message: string, status: number) =>
+    new Response(JSON.stringify({ message }), { status, headers: { 'Content-Type': 'application/json' } });
 
-        if (!sourceConnection || !destinationConnection || !category) {
-            return new Response(
-                JSON.stringify({ message: "Missing source, destination, or category" }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
+/**
+ * Syncs one settings category from the master to a replica.
+ * Body: { sourceId: string, destinationId: string, category: string }
+ */
+export async function POST(req: NextRequest) {
+    let sourceId: string;
+    let destinationId: string;
+    let category: string;
+
+    try {
+        const body = asObject(await req.json());
+        sourceId = requireString(body, 'sourceId');
+        destinationId = requireString(body, 'destinationId');
+        category = requireEnum(body, 'category', SYNC_CATEGORIES);
+    } catch (error) {
+        const message = error instanceof ValidationError
+            ? error.message
+            : "Missing source, destination, or category";
+        return jsonError(message, 400);
+    }
+
+    if (sourceId === destinationId) {
+        return jsonError("Source and destination must be different servers", 400);
+    }
+
+    try {
+        const [sourceConnection, destinationConnection] = await Promise.all([
+            resolveConnection(sourceId),
+            resolveConnection(destinationId),
+        ]);
+
+        if (!sourceConnection) return jsonError(`Unknown source connection: ${sourceId}`, 404);
+        if (!destinationConnection) return jsonError(`Unknown destination connection: ${destinationId}`, 404);
 
         return createStreamingResponse(async (log) => {
             await performCategorySync(sourceConnection, destinationConnection, category, log);
         });
-
     } catch (error) {
-        let errorMessage = "An unknown error occurred during request setup.";
-        if (error instanceof Error) {
-          errorMessage = error.message;
-        }
-        // This part won't stream, it's for initial request parsing errors
-        return new Response(
-          JSON.stringify({ message: `Internal server error: ${errorMessage}` }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
-        );
+        const errorMessage = error instanceof Error ? error.message : "An unknown error occurred during request setup.";
+        logger.error(`Internal server error in /sync-category: ${errorMessage}`);
+        return jsonError(`Internal server error: ${errorMessage}`, 500);
     }
 }

@@ -1,625 +1,501 @@
 "use client";
-import PageControls from './PageControls';
-import { useState, useEffect, useCallback, useRef } from "react";
-import CryptoJS from "crypto-js";
-import { Search, Filter, X, Lock, Unlock, Palette } from "lucide-react";
 
-// Types
-type Connection = {
-  ip?: string;
-  url?: string;
-  port?: number;
-  username: string;
-  password: string;
-  color?: string;
-};
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Search, Lock, Unlock, Palette, SlidersHorizontal, FileSearch, X } from "lucide-react";
+import PageControls, { type QueryLogOptions } from "./PageControls";
+import { connectionLabel, useConnections, type PublicConnection } from "../contexts/ConnectionsContext";
+import {
+  Alert, Badge, Button, Card, CardHeader, ConfirmDialog, EmptyState, LogConsole,
+  Modal, PageHeader, Segmented, TableSkeleton, useToast,
+} from "../components/ui";
 
 type QueryLogItem = {
-  question: {
-    name: string;
-  };
+  question: { name: string };
   client: string;
   time: string;
-  status: string;
   reason: string;
-  serverIp?: string;
-};
-
-type QueryLogResponse = {
-  data: QueryLogItem[];
+  serverId?: string;
 };
 
 type FilterStatus = 'all' | 'processed' | 'filtered';
 
+const DEFAULT_OPTIONS: QueryLogOptions = {
+  refreshInterval: 5000,
+  perServerLimit: 100,
+  concurrency: 5,
+  combinedMax: 500,
+  pageSize: 50,
+};
+
+const REASON_LABELS: Record<string, { label: string; tone: 'success' | 'danger' | 'warning' | 'info' | 'neutral' }> = {
+  NotFilteredNotFound: { label: 'Processed', tone: 'neutral' },
+  NotFilteredWhiteList: { label: 'Allowlisted', tone: 'success' },
+  NotFilteredError: { label: 'Error', tone: 'warning' },
+  FilteredBlackList: { label: 'Blocked', tone: 'danger' },
+  FilteredSafeBrowsing: { label: 'Safe browsing', tone: 'warning' },
+  FilteredParental: { label: 'Parental', tone: 'warning' },
+  FilteredInvalid: { label: 'Invalid', tone: 'warning' },
+  FilteredSafeSearch: { label: 'Safe search', tone: 'info' },
+  FilteredBlockedService: { label: 'Service blocked', tone: 'danger' },
+  Rewrite: { label: 'Rewrite', tone: 'info' },
+  RewriteEtcHosts: { label: 'Rewrite', tone: 'info' },
+  RewriteRule: { label: 'Rewrite', tone: 'info' },
+};
+
+function describeReason(reason: string) {
+  return REASON_LABELS[reason] ?? {
+    label: reason.replace(/([A-Z])/g, ' $1').trim(),
+    tone: reason.startsWith('NotFiltered') ? 'neutral' as const : 'danger' as const,
+  };
+}
+
 export default function QueryLogPage() {
-  const [connections, setConnections] = useState<Connection[]>([]);
-  const [selectedConnection, setSelectedConnection] = useState<Connection | null>(null);
-  const [selectedId, setSelectedId] = useState<string>('');
-  const [mode, setMode] = useState<'single' | 'combined'>('single');
+  const { connections, masterServerId, mode, selected, scopedConnections, isLoading: connectionsLoading, reload } =
+    useConnections();
+  const { notify } = useToast();
+
   const [logs, setLogs] = useState<QueryLogItem[]>([]);
-  const [concurrency, setConcurrency] = useState<number>(5);
-  const [perServerLimit, setPerServerLimit] = useState<number>(100);
-  const [combinedMax, setCombinedMax] = useState<number>(500);
-  const [serverCounts, setServerCounts] = useState<Record<string, number>>({});
-  const [serverColors, setServerColors] = useState<Record<string, string>>({});
-  const [masterServerIp, setMasterServerIp] = useState<string | null>(null);
-  const [pageSize, setPageSize] = useState<number>(25);
-  const [visibleCount, setVisibleCount] = useState<number>(25);
+  const [options, setOptions] = useState<QueryLogOptions>(DEFAULT_OPTIONS);
   const [filter, setFilter] = useState<FilterStatus>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [visibleCount, setVisibleCount] = useState(DEFAULT_OPTIONS.pageSize);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [refreshInterval, setRefreshInterval] = useState<number>(5000);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [showLogModal, setShowLogModal] = useState<boolean>(false);
-  const [logModalTitle, setLogModalTitle] = useState<string>('');
-  const [actionLogs, setActionLogs] = useState<string[]>([]);
-  const [searchTerm, setSearchTerm] = useState('');
-  const encryptionKey = process.env.NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY || "adguard-buddy-key";
+  const [showOptions, setShowOptions] = useState(false);
+  const [serverColors, setServerColors] = useState<Record<string, string>>({});
+
+  const [pendingRule, setPendingRule] = useState<{ domain: string; action: 'block' | 'unblock' } | null>(null);
+  const [ruleLog, setRuleLog] = useState<string[]>([]);
+  const [ruleModal, setRuleModal] = useState<{ title: string; running: boolean } | null>(null);
+
+  const scopeKey = mode === 'combined' ? 'combined' : selected?.id ?? '';
+
+  useEffect(() => {
+    const stored: Record<string, string> = {};
+    connections.forEach(conn => { if (conn.color) stored[conn.id] = conn.color; });
+    setServerColors(stored);
+  }, [connections]);
 
   const fetchLogs = useCallback(async (isPolling = false) => {
-    if (mode === 'single') {
-      if (!selectedConnection) return;
-
-      if (!isPolling) setIsLoading(true);
-      setError(null);
-
-      try {
-        let decrypted = "";
-        try {
-          decrypted = CryptoJS.AES.decrypt(selectedConnection.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-        } catch {
-          decrypted = "";
-        }
-
-        const response = await fetch('/api/query-log', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...selectedConnection,
-            password: decrypted,
-            response_status: filter,
-            limit: perServerLimit,
-          }),
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.message || 'Failed to fetch logs');
-        }
-
-        const data: QueryLogResponse = await response.json();
-        const sid = selectedConnection.url && selectedConnection.url.length > 0 ? selectedConnection.url.replace(/\/$/, '') : `${selectedConnection.ip || ''}${selectedConnection.port ? ':' + selectedConnection.port : ''}`;
-        const annotated = (data.data || []).map((item) => ({ ...item, serverIp: sid }));
-        setLogs(annotated);
-        setServerCounts({ [sid]: annotated.length });
-        setLastUpdated(new Date());
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        setError(message || 'An unknown error occurred.');
-        setLogs([]);
-        setServerCounts({});
-      } finally {
-        if (!isPolling) setIsLoading(false);
-      }
-      return;
-    }
-
-    // Combined mode
-    if (connections.length === 0) return;
+    const targets = scopedConnections;
+    if (targets.length === 0) return;
 
     if (!isPolling) setIsLoading(true);
     setError(null);
 
+    const fetchFor = async (connection: PublicConnection): Promise<QueryLogItem[]> => {
+      const response = await fetch('/api/query-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          connectionId: connection.id,
+          response_status: filter,
+          limit: options.perServerLimit,
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `Failed to fetch logs (${response.status})`);
+      }
+      const data = await response.json();
+      return ((data.data || []) as QueryLogItem[]).map(item => ({ ...item, serverId: connection.id }));
+    };
+
     try {
-      const allResults: QueryLogItem[] = [];
-      const batchSize = Math.max(1, concurrency);
+      const collected: QueryLogItem[] = [];
+      const batchSize = Math.max(1, options.concurrency);
+      const failures: { id: string; reason: string }[] = [];
 
-      const fetchForConn = async (conn: Connection) => {
-        let decrypted = "";
-        try {
-          decrypted = CryptoJS.AES.decrypt(conn.password, encryptionKey).toString(CryptoJS.enc.Utf8);
-        } catch {
-          decrypted = "";
-        }
-
-        const response = await fetch('/api/query-log', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...conn,
-            password: decrypted,
-            response_status: filter,
-            limit: perServerLimit,
-          }),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`Failed to fetch logs: ${errorText}`);
-        }
-
-        const data: QueryLogResponse = await response.json();
-        const sid = conn.url && conn.url.length > 0 ? conn.url.replace(/\/$/, '') : `${conn.ip || ''}${conn.port ? ':' + conn.port : ''}`;
-        return (data.data || []).map((item) => ({ ...item, serverIp: sid }));
-      };
-
-      for (let i = 0; i < connections.length; i += batchSize) {
-        const batch = connections.slice(i, i + batchSize);
-        const promises = batch.map(conn => fetchForConn(conn));
-        const settled = await Promise.allSettled(promises);
-
-        settled.forEach((res, idx) => {
-          const conn = batch[idx];
-          if (res.status === 'fulfilled') {
-            allResults.push(...res.value);
+      for (let i = 0; i < targets.length; i += batchSize) {
+        const batch = targets.slice(i, i + batchSize);
+        const settled = await Promise.allSettled(batch.map(fetchFor));
+        settled.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            collected.push(...result.value);
           } else {
-            console.warn(`Failed to fetch logs from ${conn.ip}: ${res.reason}`);
+            const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            failures.push({ id: batch[index].id, reason });
           }
         });
       }
 
-      allResults.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
-
-      const counts: Record<string, number> = {};
-      for (const item of allResults) {
-        const id = item.serverIp || item.client || 'Unnamed';
-        counts[id] = (counts[id] || 0) + 1;
+      // Surface why a server failed, not just that it did.
+      if (failures.length > 0) {
+        const detail = failures.map(f => `${f.id}: ${f.reason}`).join('; ');
+        if (collected.length === 0) throw new Error(detail);
+        setError(`Could not reach ${failures.length} of ${targets.length} servers - ${detail}`);
       }
-      setServerCounts(counts);
 
-      const truncated = (combinedMax > 0) ? allResults.slice(0, combinedMax) : allResults;
-      setLogs(truncated);
+      collected.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+      const capped = mode === 'combined' && options.combinedMax > 0
+        ? collected.slice(0, options.combinedMax)
+        : collected;
+
+      setLogs(capped);
       setLastUpdated(new Date());
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      setError(message || 'An unknown error occurred while fetching combined logs.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
       setLogs([]);
-      setServerCounts({});
     } finally {
       if (!isPolling) setIsLoading(false);
     }
-  }, [selectedConnection, filter, encryptionKey, connections, mode, perServerLimit, concurrency, combinedMax]);
-
-  const hexToRgba = (hex: string, alpha = 1) => {
-    if (!hex) return undefined;
-    const h = hex.replace('#', '');
-    const normalized = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
-    const bigint = parseInt(normalized, 16);
-    const r = (bigint >> 16) & 255;
-    const g = (bigint >> 8) & 255;
-    const b = bigint & 255;
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  };
+  }, [scopedConnections, filter, options.perServerLimit, options.concurrency, options.combinedMax, mode]);
 
   useEffect(() => {
+    if (!connectionsLoading) fetchLogs(false);
+  }, [connectionsLoading, scopeKey, filter, options.perServerLimit, fetchLogs]);
+
+  // Polling deliberately reuses the same fetch but does not toggle the spinner.
+  const fetchLogsRef = useRef(fetchLogs);
+  fetchLogsRef.current = fetchLogs;
+
+  useEffect(() => {
+    if (options.refreshInterval === 0 || scopedConnections.length === 0) return;
+    const id = setInterval(() => { fetchLogsRef.current(true); }, options.refreshInterval);
+    return () => clearInterval(id);
+  }, [options.refreshInterval, scopedConnections.length]);
+
+  const filteredLogs = useMemo(() => {
+    if (!searchTerm) return logs;
+    const needle = searchTerm.toLowerCase();
+    return logs.filter(log =>
+      log.question.name.toLowerCase().includes(needle) ||
+      log.client.toLowerCase().includes(needle) ||
+      (log.serverId || '').toLowerCase().includes(needle)
+    );
+  }, [logs, searchTerm]);
+
+  useEffect(() => {
+    setVisibleCount(options.pageSize);
+  }, [filter, searchTerm, options.pageSize, scopeKey]);
+
+  // Infinite scroll: the sentinel keeps the listener count at one regardless of
+  // how often the list re-renders during polling.
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const totalFiltered = filteredLogs.length;
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(entries => {
+      if (entries[0]?.isIntersecting) {
+        setVisibleCount(current => Math.min(totalFiltered, current + options.pageSize));
+      }
+    }, { rootMargin: '300px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [totalFiltered, options.pageSize]);
+
+  const persistColors = async (next: Record<string, string>) => {
+    // Colours live on the connection record, addressed by its normalized id -
+    // matching on `ip` alone silently dropped every URL and ip:port server.
+    const payload = connections.map(conn => ({
+      ip: conn.ip,
+      url: conn.url,
+      port: conn.port,
+      username: conn.username,
+      allowInsecure: conn.allowInsecure,
+      color: next[conn.id],
+    }));
+
     try {
-      const raw = localStorage.getItem('queryLogServerColors');
-      if (raw) setServerColors(JSON.parse(raw));
-    } catch { }
-  }, []);
-
-  const handlePickColor = (ip: string, color: string) => {
-    setServerColors(prev => {
-      const next = { ...prev, [ip]: color };
-      try { localStorage.setItem('queryLogServerColors', JSON.stringify(next)); } catch { }
-      return next;
-    });
-
-    setConnections(prev => {
-      const updated = prev.map(c => c.ip === ip ? { ...c, color } : c);
-      (async () => {
-        try {
-          await fetch('/api/save-connections', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ connections: updated, masterServerIp }),
-          });
-        } catch { }
-      })();
-      return updated;
-    });
-  };
-
-  const clearAllColors = async () => {
-    setServerColors({});
-    try { localStorage.removeItem('queryLogServerColors'); } catch { }
-    const updated = connections.map(c => {
-      const copy = { ...c } as Connection;
-      delete copy.color;
-      return copy;
-    });
-    setConnections(updated);
-    try {
-      await fetch('/api/save-connections', {
+      const response = await fetch('/api/save-connections', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ connections: updated, masterServerIp }),
+        body: JSON.stringify({ connections: payload, masterServerIp: masterServerId }),
       });
-    } catch { }
+      if (!response.ok) throw new Error('Failed to save colours');
+      await reload();
+    } catch {
+      notify('Could not save the server colour.', 'error');
+    }
   };
 
-  const handleBlockUnblock = async (domain: string, action: 'block' | 'unblock') => {
-    setShowLogModal(true);
-    setLogModalTitle(`Running ${action} on ${domain}...`);
-    setActionLogs([]);
+  const handlePickColor = (connectionId: string, color: string) => {
+    const next = { ...serverColors, [connectionId]: color };
+    setServerColors(next);
+    persistColors(next);
+  };
 
-    const response = await fetch('/api/set-filtering-rule', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain, action }),
-    });
+  const clearColors = () => {
+    setServerColors({});
+    persistColors({});
+  };
 
-    if (!response.body) return;
+  const runRule = async (domain: string, action: 'block' | 'unblock') => {
+    setRuleLog([]);
+    setRuleModal({ title: `${action === 'block' ? 'Blocking' : 'Unblocking'} ${domain}`, running: true });
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    try {
+      const response = await fetch('/api/set-filtering-rule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain, action, connectionIds: connections.map(c => c.id) }),
+      });
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        setLogModalTitle(prev => prev.replace('Running', 'Finished'));
-        break;
+      if (!response.ok || !response.body) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `Request failed (${response.status})`);
       }
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const jsonStr = line.substring(6);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
           try {
-            const data = JSON.parse(jsonStr);
-            setActionLogs(prev => [...prev, data.message]);
+            setRuleLog(current => [...current, JSON.parse(line.slice(6)).message]);
           } catch {
-            console.error("Failed to parse log line:", jsonStr);
+            /* ignore malformed frames */
           }
         }
       }
+
+      setRuleModal({ title: `${action === 'block' ? 'Blocked' : 'Unblocked'} ${domain}`, running: false });
+      fetchLogs(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setRuleLog(current => [...current, `Failed: ${message}`]);
+      setRuleModal({ title: `Failed to ${action} ${domain}`, running: false });
+      notify(message, 'error');
     }
   };
 
-  useEffect(() => {
-    if (mode === 'single' && !selectedConnection) return;
-    fetchLogs(false);
-  }, [selectedConnection, filter, fetchLogs, mode]);
-
-  useEffect(() => {
-    if (refreshInterval === 0) return;
-    if (mode === 'single' && !selectedConnection) return;
-
-    const intervalId = setInterval(() => {
-      if (!isLoading) {
-        fetchLogs(true);
-      }
-    }, refreshInterval);
-
-    return () => clearInterval(intervalId);
-  }, [selectedConnection, filter, isLoading, fetchLogs, refreshInterval, mode]);
-
-  useEffect(() => {
-    const fetchConnections = async () => {
-      try {
-        const response = await fetch('/api/get-connections');
-        if (!response.ok) {
-          throw new Error('Failed to fetch connections.');
-        }
-        const data = await response.json();
-        const conns = data.connections || [];
-        setConnections(conns);
-        setMasterServerIp(data.masterServerIp || null);
-        if (conns.length > 0) {
-          const first = conns[0];
-          setSelectedConnection(first);
-          const id = first.url && first.url.length > 0 ? first.url.replace(/\/$/, '') : `${first.ip || 'unknown'}${first.port ? ':' + first.port : ''}`;
-          setSelectedId(id);
-        }
-      } catch (error) {
-        const err = error as Error;
-        setError(`Error fetching connections: ${err.message}`);
-      }
-    };
-    fetchConnections();
-  }, []);
-
-  const LogViewerModal = ({ title, logs, show, onClose }: { title: string, logs: string[], show: boolean, onClose: () => void }) => {
-    const logsEndRef = useRef<HTMLDivElement>(null);
-    useEffect(() => {
-      logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [logs]);
-    if (!show) return null;
-    return (
-      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
-        <div className="bg-[#181A20] border border-[#2A2D35] rounded-xl shadow-2xl w-full max-w-4xl h-[70vh] flex flex-col">
-          <div className="flex justify-between items-center p-4 border-b border-[#2A2D35]">
-            <h2 className="text-lg font-bold text-white">{title}</h2>
-            <button onClick={onClose} className="text-gray-400 hover:text-white p-1 rounded-lg hover:bg-white/10 transition-colors">
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-          <div className="flex-grow p-4 overflow-y-auto font-mono text-sm text-gray-300 bg-[#0F1115]">
-            {logs.map((log, index) => (
-              <div key={index} className={log.startsWith('Failed') ? 'text-red-400' : ''}>{`> ${log}`}</div>
-            ))}
-            <div ref={logsEndRef} />
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  const StatusPill = ({ reason }: { reason: string }) => {
-    const isBlocked = !reason.startsWith('NotFiltered');
-
-    const formatReason = (r: string): string => {
-      switch (r) {
-        case 'NotFilteredNotFound': return 'Processed';
-        case 'NotFilteredWhiteList': return 'Whitelisted';
-        case 'FilteredBlackList': return 'Blocked (Blocklist)';
-        case 'FilteredSafeBrowsing': return 'Blocked (Safe Browsing)';
-        case 'FilteredParental': return 'Blocked (Parental)';
-        case 'FilteredInvalid': return 'Blocked (Invalid)';
-        case 'FilteredSafeSearch': return 'Blocked (Safe Search)';
-        case 'FilteredBlockedService': return 'Blocked (Service)';
-        case 'Rewrite':
-        case 'RewriteEtcHosts':
-        case 'RewriteRule':
-          return 'Rewrite';
-        default:
-          return r.replace(/([A-Z])/g, ' $1').trim();
-      }
-    }
-
-    return (
-      <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${isBlocked
-        ? 'bg-red-500/10 text-red-400 border border-red-500/20'
-        : 'bg-[var(--primary)]/10 text-[var(--primary)] border border-[var(--primary)]/20'
-        }`}>
-        {formatReason(reason)}
-      </span>
-    );
-  };
-
-  const filteredLogs = logs.filter(log => {
-    const searchTermLower = searchTerm.toLowerCase();
-    return (
-      log.question.name.toLowerCase().includes(searchTermLower) ||
-      log.client.toLowerCase().includes(searchTermLower) ||
-      (log.serverIp || '').toLowerCase().includes(searchTermLower)
-    );
-  });
-
-  useEffect(() => {
-    const minVisible = pageSize;
-    if (visibleCount < minVisible) setVisibleCount(minVisible);
-  }, [pageSize, visibleCount]);
-
-  useEffect(() => {
-    const onScroll = () => {
-      const scrollPosition = window.innerHeight + window.scrollY;
-      const nearBottom = document.body.offsetHeight - 300;
-      if (scrollPosition >= nearBottom) {
-        setVisibleCount(c => Math.min(filteredLogs.length, c + pageSize));
-      }
-    };
-
-    window.addEventListener('scroll', onScroll, { passive: true });
-    return () => window.removeEventListener('scroll', onScroll);
-  }, [pageSize, filteredLogs.length]);
-
-  // Only reset visibleCount when user changes filter/search/mode, NOT on log refreshes
-  useEffect(() => {
-    setVisibleCount(pageSize);
-  }, [filter, searchTerm, pageSize, mode]);
-
-  const filterOptions: { label: string; value: FilterStatus }[] = [
-    { label: 'All', value: 'all' },
-    { label: 'Processed', value: 'processed' },
-    { label: 'Filtered', value: 'filtered' },
-  ];
+  const showSkeleton = (connectionsLoading || isLoading) && logs.length === 0;
 
   return (
-    <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto w-full">
-      <LogViewerModal
-        show={showLogModal}
-        title={logModalTitle}
-        logs={actionLogs}
-        onClose={() => setShowLogModal(false)}
+    <div className="space-y-5">
+      <PageHeader
+        title="Query Log"
+        description={
+          mode === 'combined'
+            ? `Merged from ${connections.length} servers, newest first.`
+            : selected ? `${connectionLabel(selected)}, newest first.` : 'DNS query history.'
+        }
+        actions={
+          <>
+            {lastUpdated && (
+              <span className="tabular hidden text-[12px] text-[var(--text-subtle)] sm:inline">
+                Updated {lastUpdated.toLocaleTimeString()}
+              </span>
+            )}
+            <Button
+              size="sm"
+              variant={showOptions ? 'secondary' : 'ghost'}
+              onClick={() => setShowOptions(v => !v)}
+              aria-expanded={showOptions}
+              icon={<SlidersHorizontal className="h-4 w-4" />}
+            >
+              Options
+            </Button>
+          </>
+        }
       />
 
-      {/* Header */}
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold text-white tracking-tight">Query Log</h1>
-        <p className="text-sm text-gray-500 mt-1">View and manage DNS query history across your servers.</p>
-      </header>
+      {error && <Alert tone="danger">{error}</Alert>}
 
-      {/* Controls Card */}
-      <div className="adguard-card mb-6">
-        <PageControls
-          mode={mode}
-          setMode={setMode}
-          connectionsCount={connections.length}
-          selectedId={selectedId}
-          onSelectId={(id) => {
-            setSelectedId(id);
-            const conn = connections.find(c => (c.url && c.url.replace(/\/$/, '') === id) || c.ip === id || `${c.ip}${c.port ? ':' + c.port : ''}` === id);
-            setSelectedConnection(conn || null);
-          }}
-          refreshInterval={refreshInterval}
-          onSetRefreshInterval={(n) => setRefreshInterval(n)}
-          concurrency={concurrency}
-          setConcurrency={(n) => setConcurrency(n)}
-          perServerLimit={perServerLimit}
-          setPerServerLimit={(n) => setPerServerLimit(n)}
-          combinedMax={combinedMax}
-          setCombinedMax={(n) => setCombinedMax(n)}
-          pageSize={pageSize}
-          setPageSize={(n) => { setPageSize(n); }}
-          connections={connections}
-        />
-      </div>
+      {showOptions && (
+        <Card>
+          <CardHeader title="Fetch options" description="How much history to pull and how often." />
+          <PageControls
+            options={options}
+            combined={mode === 'combined'}
+            onChange={patch => setOptions(current => ({ ...current, ...patch }))}
+          />
+        </Card>
+      )}
 
-      {/* Filters and Search */}
-      <div className="adguard-card mb-6">
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-          <div className="flex flex-wrap items-center gap-4">
-            {/* Filter Buttons */}
-            <div className="flex gap-2">
-              {filterOptions.map(({ label, value }) => (
-                <button
-                  key={value}
-                  onClick={() => setFilter(value)}
-                  className={`px-4 py-2 text-sm font-medium rounded-lg border transition-all ${filter === value
-                    ? 'text-[var(--primary)] bg-[var(--primary)]/10 border-[var(--primary)]/30'
-                    : 'text-gray-400 border-[#2A2D35] hover:border-gray-500'
-                    }`}
-                >
-                  <Filter className="w-4 h-4 inline mr-2" />
-                  {label}
-                </button>
-              ))}
-            </div>
+      <Card>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+              label="Status filter"
+              value={filter}
+              onChange={setFilter}
+              options={[
+                { value: 'all', label: 'All' },
+                { value: 'processed', label: 'Processed' },
+                { value: 'filtered', label: 'Filtered' },
+              ]}
+            />
 
-            {/* Search */}
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" />
+            <div className="relative w-full sm:w-72">
+              <label htmlFor="query-log-search" className="sr-only">Search queries</label>
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-subtle)]"
+                aria-hidden="true"
+              />
               <input
-                type="text"
-                placeholder="Search domain or client..."
+                id="query-log-search"
+                type="search"
+                placeholder="Search domain, client or server…"
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                style={{ paddingLeft: '2.5rem' }}
-                className="pr-4 py-2 w-72 rounded-lg border border-[#2A2D35] bg-[#0F1115] text-gray-300 focus:outline-none focus:border-[var(--primary)]"
+                onChange={e => setSearchTerm(e.target.value)}
+                className="!pl-9"
               />
             </div>
           </div>
 
-          {lastUpdated && (
-            <div className="text-xs text-gray-500">
-              Last updated: {lastUpdated.toLocaleTimeString()}
+          {mode === 'combined' && connections.length > 1 && (
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--text-subtle)]">
+                <Palette className="h-3.5 w-3.5" aria-hidden="true" /> Colours
+              </span>
+              {connections.map(conn => (
+                <span key={conn.id} className="relative inline-flex h-6 w-6">
+                  <span
+                    className="h-6 w-6 rounded-[var(--radius-sm)] border border-[var(--border-strong)]"
+                    style={{ background: serverColors[conn.id] || 'transparent' }}
+                  />
+                  <input
+                    type="color"
+                    value={serverColors[conn.id] || '#3B82F6'}
+                    onChange={e => handlePickColor(conn.id, e.target.value)}
+                    aria-label={`Colour for ${connectionLabel(conn)}`}
+                    title={connectionLabel(conn)}
+                    className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                  />
+                </span>
+              ))}
+              {Object.keys(serverColors).length > 0 && (
+                <Button size="sm" variant="ghost" onClick={clearColors} icon={<X className="h-3.5 w-3.5" />}>
+                  Clear
+                </Button>
+              )}
             </div>
           )}
         </div>
+      </Card>
 
-        {/* Server Color Legend */}
-        {Object.keys(serverCounts).length > 0 && (
-          <div className="mt-4 pt-4 border-t border-[#2A2D35]">
-            <div className="flex items-center gap-2 mb-2">
-              <Palette className="w-4 h-4 text-gray-500" />
-              <span className="text-xs text-gray-500 uppercase tracking-wider">Server Colors</span>
+      <Card flush>
+        {showSkeleton ? (
+          <TableSkeleton rows={10} />
+        ) : filteredLogs.length === 0 ? (
+          <EmptyState
+            icon={<FileSearch className="h-5 w-5" />}
+            title={searchTerm ? 'No matching queries' : 'No queries logged'}
+            description={
+              searchTerm
+                ? 'Try a different search term or widen the status filter.'
+                : 'Once your AdGuard Home instances resolve queries they will appear here.'
+            }
+          />
+        ) : (
+          <>
+            <div className="max-h-[70vh] overflow-auto">
+              <table className="data-table">
+                <caption className="sr-only">DNS queries, newest first</caption>
+                <thead>
+                  <tr>
+                    {mode === 'combined' && <th scope="col">Server</th>}
+                    <th scope="col">Time</th>
+                    <th scope="col">Client</th>
+                    <th scope="col">Domain</th>
+                    <th scope="col">Status</th>
+                    <th scope="col" className="text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredLogs.slice(0, visibleCount).map((log, index) => {
+                    const blocked = !log.reason.startsWith('NotFiltered');
+                    const reason = describeReason(log.reason);
+                    const color = log.serverId ? serverColors[log.serverId] : undefined;
+                    return (
+                      <tr key={`${log.time}-${log.question.name}-${log.serverId}-${index}`}>
+                        {mode === 'combined' && (
+                          <td>
+                            <span className="flex items-center gap-2">
+                              <span
+                                className="h-2 w-2 flex-shrink-0 rounded-full"
+                                style={{ background: color || 'var(--border-strong)' }}
+                                aria-hidden="true"
+                              />
+                              <span className="max-w-[160px] truncate font-mono text-[12px]" title={log.serverId}>
+                                {log.serverId}
+                              </span>
+                            </span>
+                          </td>
+                        )}
+                        <td className="tabular whitespace-nowrap text-[12px]">
+                          {new Date(log.time).toLocaleTimeString()}
+                        </td>
+                        <td className="font-mono text-[12px]">{log.client}</td>
+                        <td className="max-w-xs break-all text-[var(--text)]">{log.question.name}</td>
+                        <td><Badge tone={reason.tone}>{reason.label}</Badge></td>
+                        <td className="text-right">
+                          <Button
+                            size="sm"
+                            variant={blocked ? 'secondary' : 'danger'}
+                            onClick={() => setPendingRule({
+                              domain: log.question.name,
+                              action: blocked ? 'unblock' : 'block',
+                            })}
+                            icon={blocked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                          >
+                            {blocked ? 'Unblock' : 'Block'}
+                          </Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div ref={sentinelRef} aria-hidden="true" />
             </div>
-            <div className="flex flex-wrap gap-3 items-center">
-              {Object.keys(serverCounts).slice(0, 10).map((ip) => {
-                const color = serverColors[ip];
-                const truncate = (s: string, n = 30) => s.length > n ? `${s.slice(0, n - 3)}...` : s;
-                return (
-                  <div key={ip} className="flex items-center gap-2">
-                    <div className="relative w-6 h-6">
-                      <div className="w-6 h-6 rounded-md border border-[#2A2D35]" style={{ backgroundColor: color || 'transparent' }} />
-                      <input
-                        type="color"
-                        value={color || '#000000'}
-                        onChange={(e) => handlePickColor(ip, e.target.value)}
-                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                        aria-label={`Color for ${ip}`}
-                      />
-                    </div>
-                    <span className="text-xs text-gray-400 font-mono">{truncate(ip)}</span>
-                  </div>
-                );
-              })}
-              <button
-                onClick={() => clearAllColors()}
-                className="px-3 py-1.5 text-xs font-medium text-gray-400 bg-[#0F1115] rounded-md border border-[#2A2D35] hover:border-gray-500 transition-colors"
+
+            <div className="flex items-center justify-between border-t border-[var(--border)] px-4 py-3">
+              <span className="tabular text-[12px] text-[var(--text-subtle)]">
+                Showing {Math.min(visibleCount, filteredLogs.length)} of {filteredLogs.length}
+              </span>
+              <Button
+                size="sm"
+                disabled={visibleCount >= filteredLogs.length}
+                onClick={() => setVisibleCount(c => Math.min(filteredLogs.length, c + options.pageSize))}
               >
-                Clear colors
-              </button>
+                Load more
+              </Button>
             </div>
-          </div>
+          </>
         )}
-      </div>
+      </Card>
 
-      {/* Loading / Error states */}
-      {isLoading && <div className="text-center py-8 text-[var(--primary)]">Loading logs...</div>}
-      {error && <div className="mb-6 p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400">{error}</div>}
+      <ConfirmDialog
+        open={pendingRule !== null}
+        title={pendingRule?.action === 'block' ? 'Block domain' : 'Unblock domain'}
+        tone={pendingRule?.action === 'block' ? 'danger' : 'primary'}
+        confirmLabel={pendingRule?.action === 'block' ? 'Block everywhere' : 'Unblock everywhere'}
+        description={
+          <>
+            This writes a custom filtering rule for{' '}
+            <span className="font-mono text-[var(--text)]">{pendingRule?.domain}</span> on{' '}
+            <strong className="text-[var(--text)]">all {connections.length} configured server(s)</strong>,
+            not just the one you are viewing.
+          </>
+        }
+        onCancel={() => setPendingRule(null)}
+        onConfirm={() => {
+          const rule = pendingRule;
+          setPendingRule(null);
+          if (rule) runRule(rule.domain, rule.action);
+        }}
+      />
 
-      {/* Query Log Table */}
-      {!isLoading && !error && (
-        <div className="adguard-card overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="text-xs text-gray-500 uppercase tracking-wider">
-                <tr className="border-b border-[#2A2D35]">
-                  <th scope="col" className="px-4 py-3 text-left">Server</th>
-                  <th scope="col" className="px-4 py-3 text-left">Timestamp</th>
-                  <th scope="col" className="px-4 py-3 text-left">Client</th>
-                  <th scope="col" className="px-4 py-3 text-left">Domain</th>
-                  <th scope="col" className="px-4 py-3 text-left">Status</th>
-                  <th scope="col" className="px-4 py-3 text-left">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredLogs.slice(0, visibleCount).map((log, index) => {
-                  const isBlocked = !log.reason.startsWith('NotFiltered');
-                  const ip = log.serverIp || selectedConnection?.ip || 'unknown';
-                  const color = serverColors[ip];
-                  const bgColor = color ? hexToRgba(color, 0.06) : undefined;
-                  const leftBorder = color ? { borderLeft: `3px solid ${color}` } : {};
-                  return (
-                    <tr
-                      key={index}
-                      style={{ backgroundColor: bgColor, ...leftBorder }}
-                      className="border-b border-[#2A2D35]/50 hover:bg-white/5 transition-colors"
-                    >
-                      <td className="px-4 py-3 font-mono text-gray-400 text-xs">{ip.substring(0, 30)}</td>
-                      <td className="px-4 py-3 text-gray-400">{new Date(log.time).toLocaleString()}</td>
-                      <td className="px-4 py-3 font-mono text-gray-300">{log.client}</td>
-                      <td className="px-4 py-3 text-gray-300 break-all max-w-xs">{log.question.name}</td>
-                      <td className="px-4 py-3">
-                        <StatusPill reason={log.reason} />
-                      </td>
-                      <td className="px-4 py-3">
-                        <button
-                          onClick={() => handleBlockUnblock(log.question.name, isBlocked ? 'unblock' : 'block')}
-                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${isBlocked
-                            ? 'text-[var(--primary)] border-[var(--primary)]/30 hover:bg-[var(--primary)]/10'
-                            : 'text-red-400 border-red-500/30 hover:bg-red-500/10'
-                            }`}
-                          title={isBlocked ? "Remove from blocklist" : "Add to blocklist"}
-                        >
-                          {isBlocked ? <Unlock className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
-                          {isBlocked ? 'Unblock' : 'Block'}
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {filteredLogs.length === 0 && (
-              <div className="text-center py-12 text-gray-500">No logs found.</div>
-            )}
-          </div>
-
-          {/* Pagination Footer */}
-          <div className="flex items-center justify-between p-4 border-t border-[#2A2D35]">
-            <div className="text-xs text-gray-500">
-              Showing 1 - {Math.min(visibleCount, filteredLogs.length)} of {filteredLogs.length}
-            </div>
-            <button
-              disabled={visibleCount >= filteredLogs.length}
-              onClick={() => setVisibleCount(c => Math.min(filteredLogs.length, c + pageSize))}
-              className={`px-4 py-2 text-sm font-medium rounded-lg border transition-colors ${visibleCount >= filteredLogs.length
-                ? 'opacity-50 cursor-not-allowed text-gray-500 border-[#2A2D35]'
-                : 'text-[var(--primary)] border-[var(--primary)]/30 hover:bg-[var(--primary)]/10'
-                }`}
-            >
-              Load more
-            </button>
-          </div>
-        </div>
-      )}
-    </main>
+      <Modal
+        open={ruleModal !== null}
+        onClose={() => setRuleModal(null)}
+        title={ruleModal?.title ?? ''}
+        subtitle={ruleModal?.running ? 'Applying the rule to every server…' : 'Finished'}
+        size="lg"
+      >
+        <LogConsole lines={ruleLog} running={ruleModal?.running ?? false} />
+      </Modal>
+    </div>
   );
 }
