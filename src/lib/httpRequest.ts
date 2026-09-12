@@ -5,13 +5,35 @@ import { RequestOptions } from 'http';
 /** Default socket/response timeout so an unreachable server cannot hang a request forever. */
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
+/**
+ * Returns the default timeout for outgoing AdGuard Home requests.
+ *
+ * ADGUARD_BUDDY_REQUEST_TIMEOUT_MS can override the built-in 15 second default.
+ * Set it to 0 to disable the timeout. Invalid or negative values fall back to
+ * DEFAULT_TIMEOUT_MS.
+ */
+export function getDefaultTimeoutMs(): number {
+  const configured = process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
+
+  if (configured === undefined || configured.trim() === '') {
+    return DEFAULT_TIMEOUT_MS;
+  }
+
+  const parsed = Number(configured);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+
+  return parsed;
+}
+
 export type HttpRequestOptions = {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   url: string;
   headers?: Record<string, string>;
   body?: string | null;
   allowInsecure?: boolean;
-  /** Milliseconds before the request is aborted. Defaults to DEFAULT_TIMEOUT_MS. */
+  /** Milliseconds before the request is aborted. Defaults to the configured global timeout. */
   timeoutMs?: number;
 };
 
@@ -34,7 +56,7 @@ export async function httpRequest(opts: HttpRequestOptions): Promise<HttpRequest
       const parsed = new URL(opts.url);
       const isHttps = parsed.protocol === 'https:';
       const lib = isHttps ? https : http;
-      const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      const timeoutMs = opts.timeoutMs ?? getDefaultTimeoutMs();
 
       const requestOptions: RequestOptions = {
         method: opts.method,
