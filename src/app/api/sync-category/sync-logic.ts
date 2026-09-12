@@ -162,7 +162,10 @@ export async function performCategorySync(
         await syncFilterList(masterSettings.filters, replicaSettings.filters, false);
         await syncFilterList(masterSettings.whitelist_filters, replicaSettings.whitelist_filters, true);
 
-        // Trigger filter list refresh on BOTH master and replica to ensure both have latest rules
+        // Refresh only the master. The replica must not be forced to fetch the
+        // master's URLs because some providers (for example Q-Feeds) use
+        // per-server API keys embedded in those URLs. Skipping the replica
+        // refresh also avoids long blocking refresh requests during sync.
         log("--> Triggering filter list refresh on master...");
         const masterRefreshRes = await fetchApi(sourceConnection, 'filtering/refresh', {
             method: 'POST',
@@ -175,19 +178,7 @@ export async function performCategorySync(
         } else {
             log("<- Master filter refresh triggered successfully.");
         }
-
-        log("--> Triggering filter list refresh on replica...");
-        const replicaRefreshRes = await fetchApi(destinationConnection, 'filtering/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ whitelist: false }),
-        });
-        if (!replicaRefreshRes.ok) {
-            const errorText = await replicaRefreshRes.text();
-            log(`<- WARNING: Replica filter refresh failed: ${replicaRefreshRes.status} ${errorText}`);
-        } else {
-            log("<- Replica filter refresh triggered successfully.");
-        }
+        log("<- Replica filter refresh skipped by design.");
 
     } else if (category === 'querylogConfig' || category === 'statsConfig') {
         const getConfigEndpoint = category === 'querylogConfig' ? 'querylog/config' : 'stats/config';
