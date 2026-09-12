@@ -8,7 +8,8 @@ import { readMigratedStore, resolveAllConnections, type ResolvedConnection } fro
 
 const DATA_DIR = path.join(process.cwd(), '.data');
 const CONFIG_FILE = path.join(DATA_DIR, 'auto-sync-config.json');
-const LOGS_FILE = path.join(DATA_DIR, 'auto-sync-logs.json');
+const LOGS_DIR = path.join(DATA_DIR, 'logs');
+const LOGS_FILE = path.join(LOGS_DIR, 'auto-sync-logs.json');
 const MAX_LOG_ENTRIES = 500;
 
 class AutoSyncScheduler {
@@ -69,8 +70,8 @@ class AutoSyncScheduler {
 
   private saveLogs(): void {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+      if (!fs.existsSync(LOGS_DIR)) {
+        fs.mkdirSync(LOGS_DIR, { recursive: true });
       }
 
       // Keep only the most recent logs
