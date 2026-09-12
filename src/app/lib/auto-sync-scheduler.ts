@@ -6,8 +6,10 @@ import logger from '../api/logger';
 import { getConnectionId } from '@/lib/connectionUtils';
 import { readMigratedStore, resolveAllConnections, type ResolvedConnection } from '@/lib/serverConnections';
 
-const CONFIG_FILE = path.join(process.cwd(), 'auto-sync-config.json');
-const LOGS_FILE = path.join(process.cwd(), 'logs', 'auto-sync-logs.json');
+const DATA_DIR = path.join(process.cwd(), '.data');
+const CONFIG_FILE = path.join(DATA_DIR, 'auto-sync-config.json');
+const LOGS_DIR = path.join(DATA_DIR, 'logs');
+const LOGS_FILE = path.join(LOGS_DIR, 'auto-sync-logs.json');
 const MAX_LOG_ENTRIES = 500;
 
 class AutoSyncScheduler {
@@ -41,6 +43,9 @@ class AutoSyncScheduler {
 
   private saveConfig(): void {
     try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
       fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2));
       logger.info('Auto-sync config saved');
     } catch (error) {
@@ -65,12 +70,10 @@ class AutoSyncScheduler {
 
   private saveLogs(): void {
     try {
-      // Ensure logs directory exists
-      const logsDir = path.dirname(LOGS_FILE);
-      if (!fs.existsSync(logsDir)) {
-        fs.mkdirSync(logsDir, { recursive: true });
+      if (!fs.existsSync(LOGS_DIR)) {
+        fs.mkdirSync(LOGS_DIR, { recursive: true });
       }
-      
+
       // Keep only the most recent logs
       const recentLogs = this.syncLogs.slice(-MAX_LOG_ENTRIES);
       fs.writeFileSync(LOGS_FILE, JSON.stringify(recentLogs, null, 2));
