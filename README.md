@@ -143,9 +143,11 @@ app open, which is only appropriate behind another layer of access control.
 | `ADGUARD_BUDDY_ENCRYPTION_KEY` | recommended | Encrypts AdGuard Home passwords in `.data/connections.json`. Defaults to `adguard-buddy-key`, which is not safe for real credentials. |
 | `ADGUARD_BUDDY_AUTH_USER` | optional | Username for HTTP Basic auth. Auth is off unless this and the password are both set. |
 | `ADGUARD_BUDDY_AUTH_PASSWORD` | optional | Password for HTTP Basic auth. |
+| `ADGUARD_BUDDY_REQUEST_TIMEOUT_MS` | optional | Default timeout in milliseconds for outgoing AdGuard Home requests. Defaults to `15000`. Set to `0` to disable the timeout. |
 
 ```bash
 export ADGUARD_BUDDY_ENCRYPTION_KEY="your-strong-key"
+export ADGUARD_BUDDY_REQUEST_TIMEOUT_MS="60000"
 ```
 
 > **Migrating from `NEXT_PUBLIC_ADGUARD_BUDDY_ENCRYPTION_KEY`:** that variable was
@@ -178,28 +180,3 @@ normalized `url` or `ip:port` of a stored connection — and never credentials:
 
 ![Dashboard](pics/dashboard.png)
 ---
----
-![Query Log](pics/querylog.png)
----
----
-![Statistics](pics/stats.png)
-![alt text](pics/combined_stats.png)
----
----
-![Sync Status](pics/sync.png)
----
----
-![Settings](pics/settings.png)
-
----
-
-## 🤝 Contributors
-
-- [chrizzo84](https://github.com/chrizzo84) – Maintainer
-
----
-
-## 📄 License
-
-MIT
-
