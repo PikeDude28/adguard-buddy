@@ -1,4 +1,4 @@
-import { httpRequest, DEFAULT_TIMEOUT_MS } from '../httpRequest';
+import { httpRequest, DEFAULT_TIMEOUT_MS, getDefaultTimeoutMs } from '../httpRequest';
 import http from 'http';
 import https from 'https';
 
@@ -15,6 +15,7 @@ describe('httpRequest', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
 
     // Setup mock response with proper event handling
     const responseOnMock = jest.fn().mockImplementation((event: string | symbol, callback: (...args: any[]) => void) => {
@@ -129,7 +130,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle custom port', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'GET',
       url: 'http://example.com:8080/api/test',
     });
@@ -144,7 +145,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle query parameters', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'GET',
       url: 'https://example.com/api/test?param1=value1&param2=value2',
     });
@@ -159,7 +160,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle allowInsecure for HTTPS', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'GET',
       url: 'https://example.com/api/test',
       allowInsecure: true,
@@ -176,7 +177,7 @@ describe('httpRequest', () => {
   });
 
   it('should not set rejectUnauthorized for HTTP with allowInsecure', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'GET',
       url: 'http://example.com/api/test',
       allowInsecure: true,
@@ -192,7 +193,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle PUT method', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'PUT',
       url: 'https://example.com/api/test',
       body: 'updated data',
@@ -210,7 +211,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle DELETE method', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'DELETE',
       url: 'https://example.com/api/test',
     });
@@ -227,7 +228,6 @@ describe('httpRequest', () => {
   });
 
   it('should handle multiple data chunks', async () => {
-    // Override the default behavior for this test
     mockResponse.on.mockClear();
     mockResponse.on.mockImplementation((event: string | symbol, callback: (...args: any[]) => void) => {
       if (event === 'data') {
@@ -254,7 +254,6 @@ describe('httpRequest', () => {
   it('should handle request error', async () => {
     const networkError = new Error('Network connection failed');
 
-    // Override the mock request for this specific test
     mockRequest.on.mockClear();
     mockRequest.on.mockImplementation((event: string | symbol, callback: (...args: any[]) => void) => {
       if (event === 'error') {
@@ -263,12 +262,8 @@ describe('httpRequest', () => {
       return mockRequest;
     });
 
-    // Override the mock response to not emit data/end events
     mockResponse.on.mockClear();
-    mockResponse.on.mockImplementation((event: string | symbol, callback: (...args: any[]) => void) => {
-      // Don't emit data or end events for error case
-      return mockResponse;
-    });
+    mockResponse.on.mockImplementation(() => mockResponse);
 
     await expect(httpRequest({
       method: 'GET',
@@ -284,7 +279,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle null body', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'POST',
       url: 'https://example.com/api/test',
       body: null,
@@ -295,7 +290,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle empty body', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'POST',
       url: 'https://example.com/api/test',
       body: '',
@@ -316,7 +311,7 @@ describe('httpRequest', () => {
   });
 
   it('should handle empty headers', async () => {
-    const result = await httpRequest({
+    await httpRequest({
       method: 'GET',
       url: 'https://example.com/api/test',
       headers: {},
@@ -332,9 +327,45 @@ describe('httpRequest', () => {
   });
 });
 
+describe('default timeout configuration', () => {
+  const original = process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
+    } else {
+      process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = original;
+    }
+  });
+
+  it('uses the built-in default when the environment variable is unset', () => {
+    delete process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
+    expect(getDefaultTimeoutMs()).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('uses ADGUARD_BUDDY_REQUEST_TIMEOUT_MS when set to a positive number', () => {
+    process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = '60000';
+    expect(getDefaultTimeoutMs()).toBe(60_000);
+  });
+
+  it('allows zero to disable the global timeout', () => {
+    process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = '0';
+    expect(getDefaultTimeoutMs()).toBe(0);
+  });
+
+  it('falls back to the built-in default for invalid values', () => {
+    process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = 'not-a-number';
+    expect(getDefaultTimeoutMs()).toBe(DEFAULT_TIMEOUT_MS);
+
+    process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = '-1';
+    expect(getDefaultTimeoutMs()).toBe(DEFAULT_TIMEOUT_MS);
+  });
+});
+
 describe('httpRequest timeouts', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS;
   });
 
   it('arms a socket timeout with the default duration', async () => {
@@ -366,6 +397,36 @@ describe('httpRequest timeouts', () => {
     expect(setTimeoutMock).toHaveBeenCalledWith(DEFAULT_TIMEOUT_MS, expect.any(Function));
   });
 
+  it('uses the configured environment timeout by default', async () => {
+    process.env.ADGUARD_BUDDY_REQUEST_TIMEOUT_MS = '60000';
+    const setTimeoutMock = jest.fn();
+    const request = {
+      write: jest.fn(),
+      end: jest.fn(),
+      on: jest.fn(),
+      setTimeout: setTimeoutMock,
+      destroy: jest.fn(),
+    };
+    const response = {
+      statusCode: 200,
+      headers: {},
+      setEncoding: jest.fn(),
+      on: jest.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'end') setTimeout(() => cb(), 0);
+        return response;
+      }),
+    };
+
+    (http.request as unknown as jest.Mock).mockImplementation((_options, callback) => {
+      if (callback) callback(response);
+      return request;
+    });
+
+    await httpRequest({ method: 'GET', url: 'http://example.com/x' });
+
+    expect(setTimeoutMock).toHaveBeenCalledWith(60_000, expect.any(Function));
+  });
+
   it('destroys the request when the timeout fires', async () => {
     const destroy = jest.fn();
     let fireTimeout: (() => void) | undefined;
@@ -374,7 +435,6 @@ describe('httpRequest timeouts', () => {
       end: jest.fn(),
       on: jest.fn().mockImplementation((event: string, cb: (error: Error) => void) => {
         if (event === 'error') {
-          // Surface the destroy() error the way node does.
           setTimeout(() => {
             fireTimeout?.();
             cb(new Error('Request to example.com timed out after 50ms'));
