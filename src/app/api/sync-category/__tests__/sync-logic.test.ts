@@ -97,7 +97,7 @@ describe('performCategorySync', () => {
       whitelist_filters: [],
     };
 
-    it('syncs config, rules and filter lists, then refreshes both sides', async () => {
+    it('syncs config, rules and filter lists, then refreshes the master only', async () => {
       route({
         'filtering/status': isSource => ok(isSource
           ? masterStatus
@@ -116,8 +116,9 @@ describe('performCategorySync', () => {
         .toEqual({ rules: ['||ads.test^'] });
       expect(JSON.parse(callsTo('filtering/add_url')[0][0].body as string))
         .toEqual({ url: 'https://a.test/list.txt', name: 'A', whitelist: false });
-      // Both master and replica get refreshed.
-      expect(callsTo('filtering/refresh')).toHaveLength(2);
+      const refreshCalls = callsTo('filtering/refresh');
+      expect(refreshCalls).toHaveLength(1);
+      expect(refreshCalls[0][0].url).toBe('http://192.168.1.1:80/control/filtering/refresh');
     });
 
     it('removes filters the master no longer has', async () => {
@@ -202,7 +203,7 @@ describe('performCategorySync', () => {
         .rejects.toThrow(/Failed to sync user rules/);
     });
 
-    it('warns but does not fail when a refresh call fails', async () => {
+    it('warns but does not fail when the master refresh call fails', async () => {
       route({
         'filtering/status': () => ok({ ...masterStatus, filters: [], whitelist_filters: [] }),
         'filtering/config': () => ok({}),
@@ -212,7 +213,7 @@ describe('performCategorySync', () => {
 
       await expect(performCategorySync(SOURCE, DEST, 'filtering', log)).resolves.toBeUndefined();
       expect(log).toHaveBeenCalledWith(expect.stringContaining('WARNING: Master filter refresh failed'));
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('WARNING: Replica filter refresh failed'));
+      expect(callsTo('filtering/refresh')).toHaveLength(1);
     });
   });
 
