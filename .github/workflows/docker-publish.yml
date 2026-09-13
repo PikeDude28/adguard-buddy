@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
   workflow_dispatch:
 
 jobs:
@@ -14,6 +16,7 @@ jobs:
       packages: write
     env:
       IMAGE_NAME: ghcr.io/pikedude28/adguard-buddy
+      BUILD_TAG: build-${{ github.run_number }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,12 +33,16 @@ jobs:
           docker build \
             --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --build-arg VCS_REF="${{ github.sha }}" \
-            --build-arg VERSION="${{ github.ref_name }}" \
+            --build-arg VERSION="${BUILD_TAG}" \
             -t "${IMAGE_NAME}:latest" .
+          docker tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${BUILD_TAG}"
           docker tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${{ github.sha }}"
 
       - name: Push Docker image (latest)
         run: docker push "${IMAGE_NAME}:latest"
+
+      - name: Push Docker image (build number)
+        run: docker push "${IMAGE_NAME}:${BUILD_TAG}"
 
       - name: Push Docker image (commit SHA)
         run: docker push "${IMAGE_NAME}:${{ github.sha }}"
